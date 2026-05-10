@@ -1,0 +1,812 @@
+================================================================================
+  ARKAD MRK — PAPER TRADING PROTOCOL
+  Assets: AVAXUSDT, ADAUSDT, SOLUSDT, XRPUSDT  (Tier 1 portfolio)
+  System: 1H CalibratedRF  +  15m-AB Execution (Approach A+B)
+        + SCALED EXIT  (TP1/TP2/TP3 + BE stop after TP1)
+  Version: 2.0  |  Date: 2026-05-10
+
+  v2 changes vs v1.0 (2026-03-19):
+    - Switched exit model: single TP=2.5xATR -> scaled exit (TP1/TP2/TP3 + BE)
+    - Tier 1 expanded: BTCUSDT replaced by ADAUSDT, SOLUSDT, XRPUSDT
+    - Backtest engine.py now has native scaled exit (matches paper_trading)
+    - Single source of truth: config.SCALED_* mirrored in config_live.py
+    - Validated on 3-year native walk-forward (5,136 -> 6,076 trades):
+        PF 1.426 -> 1.845, Max DD 17.98% -> 5.12% (71% drawdown reduction)
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 1 — EXECUTION PROTOCOL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1.1  SIGNAL GENERATION (1H bar close)
+──────────────────────────────────────
+
+  Trigger  : The model is evaluated ONLY at confirmed 1H bar CLOSE.
+             "Confirmed" = next 1H bar has opened on the exchange.
+             Never evaluate on a bar that is still forming.
+
+  Source   : main.py pipeline on the full historical window up to and
+             including the just-closed bar.
+
+  Condition:
+    LONG  signal  → P(BUY)  >= 0.55  (buy probability from model)
+    SHORT signal  → P(BUY)  <= 0.45  (sell probability >= 0.55)
+    FLAT         → all other cases  (no trade)
+
+  Filters (applied in this order before passing to 15m layer):
+    1. BLOCK_LOW_VOL = True  → skip if current 1H ATR/ATR_median < 0.75
+    2. No open position already exists on this asset (no pyramiding)
+    3. Signal must pass 15m-A filter (Section 1.2)
+
+  Reference price: The CLOSE price of the triggering 1H bar.
+                   This is the price used by the pullback filter in Step B.
+
+1.2  APPROACH A — MOMENTUM CONSISTENCY FILTER (Hard gate)
+──────────────────────────────────────────────────────────
+
+  Window  : The 4 consecutive 15m bars that open AFTER the 1H signal bar closes.
+            i.e., bars at T+0m, T+15m, T+30m, T+45m where T = 1H signal close time.
+
+  Rule    : Count bars where (close > open) for LONG, (close < open) for SHORT.
+            If aligned_count < 2  →  CANCEL the trade entirely.
+            If aligned_count >= 2 →  Proceed to Step B.
+
+  Timing  : Decision is made at T+60m (i.e., when the 4th 15m bar closes).
+             No early exit from the A window.
+
+  Fallback: If 15m data is unavailable (data feed outage) → SKIP the trade.
+            Do not fall back to baseline entry when A cannot be evaluated.
+            Reason: the A filter is responsible for the majority of the
+            system's OOS improvement; bypassing it removes the edge.
+
+1.3  APPROACH B — PULLBACK ENTRY (Price improvement)
+──────────────────────────────────────────────────────
+
+  Starts  : Immediately after A confirmation (T+60m from signal).
+  Window  : Up to 4 additional 15m bars (T+60m to T+120m = bars 5-8).
+
+  Mechanism (state machine):
+    Phase 0 — Waiting for pullback:
+      LONG  : Any 15m bar where close < 1H_reference_price  → Phase 1
+      SHORT : Any 15m bar where close > 1H_reference_price  → Phase 1
+
+    Phase 1 — Waiting for resumption:
+      LONG  : Next 15m bar where close > open  → ENTRY at that bar's close
+      SHORT : Next 15m bar where close < open  → ENTRY at that bar's close
+
+  Fallback: If no pullback+resumption pattern completes within bars 5-8
+            → enter at the CLOSE of bar 8 at the 1H reference price.
+            The trade is always taken once A passes. No trades are dropped.
+
+  Entry price (pre-slippage):
+    Pullback found : close price of the resumption bar
+    Fallback       : close price of the 1H signal bar (reference price)
+
+1.4  FILL PRICE (Slippage model)
+──────────────────────────────────
+
+  Entry (market order, taker):
+    LONG  fill = entry_price_pre_slip * (1 + 0.0002)   [+2 bps]
+    SHORT fill = entry_price_pre_slip * (1 - 0.0002)   [-2 bps]
+
+  Stop loss (market order, adverse fill):
+    LONG  fill = stop_price * (1 - 0.0002)
+    SHORT fill = stop_price * (1 + 0.0002)
+
+  Take profit (limit order, exact fill):
+    Both directions: fill = tp_price  (no slippage)
+
+  Time exit (market order at bar close):
+    LONG  fill = bar_close * (1 - 0.0002)
+    SHORT fill = bar_close * (1 + 0.0002)
+
+  Commission: 0.10% round-trip, deducted from net P&L post-exit.
+    commission = (entry_fill + exit_fill) * position_size_in_units * 0.001
+
+1.5  STOP LOSS AND TAKE PROFIT  (SCALED EXIT, v2)
+──────────────────────────────────────────────────
+
+  ATR used  : 14-bar ATR computed on 1H bars, taken at the time of the
+              1H signal close (NOT recalculated at 15m entry time).
+
+  Initial SL at entry (= 1R = full risk unit):
+    LONG  : stop_price = entry_fill - 1.5 * ATR_1H
+    SHORT : stop_price = entry_fill + 1.5 * ATR_1H
+
+  Three partial take-profit levels (defined in R-units off entry):
+    sl_dist = |entry_fill - stop_price|   (= 1.5 * ATR_1H = 1R)
+
+    LONG:
+      tp1_price = entry_fill + 0.65 * sl_dist  → close 50% of position
+      tp2_price = entry_fill + 1.00 * sl_dist  → close 25%
+      tp3_price = entry_fill + 1.67 * sl_dist  → close remaining 25%
+
+    SHORT (mirrored):
+      tp1_price = entry_fill - 0.65 * sl_dist  → close 50%
+      tp2_price = entry_fill - 1.00 * sl_dist  → close 25%
+      tp3_price = entry_fill - 1.67 * sl_dist  → close remaining 25%
+
+  Rules:
+    - SL and all three TPs are FIXED at entry. No trailing stop.
+    - When TP1 fires: stop is moved to BREAKEVEN (entry_fill) on remainder.
+      This is the BE stop — protects the unrealized portion from going back
+      to original SL.
+    - TP1, TP2, TP3 are LIMIT orders (no slippage on fill).
+    - SL and BE fills incur taker slippage (Section 1.4).
+    - If price gaps through SL or BE: fill at first available price; note
+      "gap stop" in Notes.
+    - R:R per trade = 1.667 by construction (TP3 vs SL).
+
+  Source of truth: parameters live in config.py (SCALED_TP1_R, SCALED_TP2_R,
+  SCALED_TP3_R, SCALED_TP1_FRAC, SCALED_TP2_FRAC, SCALED_TP3_FRAC) and are
+  mirrored in paper_trading/config_live.py. backtest/engine.py implements
+  the same state machine natively when BACKTEST_EXIT_MODE = "scaled".
+
+1.6  EXIT RULES  (priority order, checked each 1H bar)
+───────────────────────────────────────────────────────
+
+  State machine: position is in one of two phases:
+    PRE_TP1   — full position open; TP1 has not fired yet
+    POST_TP1  — TP1 has fired in a PRIOR bar; partial remainder is open and
+                protected by a BE stop at entry price
+
+  Priority within a bar:
+
+  PHASE = PRE_TP1:
+    1. SL hit (LONG: low <= stop_price | SHORT: high >= stop_price)
+       → close full position at stop fill price, reason = "stop"
+    2. TP1 hit (LONG: high >= tp1_price | SHORT: low <= tp1_price)
+       → close 50% at tp1_price (limit, no slip)
+       → state moves to POST_TP1
+       → SAME BAR: also check TP2 and TP3 for cascading partial close
+    3. Time exit (24 1H bars elapsed)
+       → close full remaining position at bar close + slippage
+
+  PHASE = POST_TP1:
+    1. BE stop hit (LONG: low <= entry | SHORT: high >= entry)
+       → close remaining fraction at BE fill price, reason = "stop"
+       BE STOP IS PRIORITY 1 IN THIS PHASE (replaces the original SL).
+    2. TP2 hit (only if not yet hit)
+       → close 25% at tp2_price
+    3. TP3 hit (LONG: high >= tp3_price | SHORT: low <= tp3_price)
+       → close remaining 25% at tp3_price, reason = "tp", trade complete
+    4. Time exit (24 1H bars elapsed)
+       → close remaining fraction at bar close + slippage
+
+  Same-bar conflicts (conservative ordering, matches backtest engine):
+    - In PRE_TP1: if both SL and TP1 touched → assume SL filled first.
+    - In POST_TP1: if both BE and TP2/TP3 touched → assume BE filled first.
+    - If TP1 fires THIS bar, BE is NOT checked the same bar (only starting
+      next bar). This is intentional and mirrors paper_trading exactly.
+
+1.7  POSITION SIZING
+──────────────────────
+
+  Position value   = current_equity * 0.10  (10% of equity, single source of
+                                              truth: config.POSITION_SIZE_PCT)
+  Total units      = position_value / entry_fill_price
+  Dollar risk (1R) = total_units * |entry_fill - stop_price|  (full-position risk)
+
+  Partial close arithmetic (scaled exit):
+    TP1 fires: close 50% of total_units at tp1_price
+    TP2 fires: close 25% of total_units at tp2_price
+    TP3 fires: close 25% of total_units at tp3_price
+    BE  fires: close current remaining_fraction at entry_fill (BE level)
+
+  Each partial generates its own commission + slippage cost. Net realized PnL
+  per trade = sum of all partial closes minus all costs.
+
+  No pyramiding: one open position per asset at all times.
+  If a new signal fires on an asset while already in a trade on that asset,
+  the new signal is IGNORED.
+
+1.8  MULTI-ASSET CONCURRENT POSITIONS
+───────────────────────────────────────
+
+  Up to 4 simultaneous positions allowed (one per asset: AVAX, ADA, SOL, XRP).
+  Each position uses 10% of TOTAL current equity at time of entry.
+  Maximum concurrent exposure = 40% of equity.
+  Positions are independent: no correlation adjustment.
+
+1.9  WHAT IS FORBIDDEN
+─────────────────────────
+
+  - Early exit before SL / TP1 / TP2 / TP3 / BE / time trigger
+  - Moving SL, BE, TP1, TP2, or TP3 after entry for any reason
+  - Adding to a winning or losing position
+  - Closing the remainder manually after TP1 fires (BE stop manages it)
+  - Skipping a signal that passed A+B because you "don't like the setup"
+  - Taking a trade that failed the A filter
+  - Any discretionary override of any kind
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 2 — TRADE LOG TEMPLATE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+File: paper_trades.csv
+
+Columns (one row per CLOSED trade):
+
+  Column              Type      Description
+  ──────────────────────────────────────────────────────────────────────────
+  trade_id            INT       Sequential integer, 1-based per asset or global
+  symbol              STR       AVAXUSDT | ADAUSDT | SOLUSDT | XRPUSDT
+  signal_time         DATETIME  UTC datetime of 1H bar that triggered the signal
+  direction           STR       long | short
+  a_filter_result     STR       pass | fail | no_data
+  a_aligned_bars      INT       Number of aligned bars (0-4); blank if a_filter_result=fail
+  b_pullback_found    BOOL      TRUE if pullback pattern completed; FALSE = fallback entry
+  entry_time          DATETIME  UTC datetime of 15m bar that filled entry
+  entry_price_raw     FLOAT     Pre-slippage entry price (pullback close or 1H ref)
+  entry_price_fill    FLOAT     Actual fill price (after slippage)
+  atr_1h              FLOAT     14-bar 1H ATR at signal time
+  stop_price          FLOAT     Initial SL level (1R below/above entry)
+  tp1_price           FLOAT     TP1 = entry +/- 0.65R   (50% close)
+  tp2_price           FLOAT     TP2 = entry +/- 1.00R   (25% close)
+  tp_price            FLOAT     TP3 = entry +/- 1.67R   (final 25% close)
+  risk_1r_usd         FLOAT     Dollar risk per 1R = |entry_fill - stop_price| * units
+  position_value_usd  FLOAT     entry_fill * units (notional, full position)
+  tp1_time            DATETIME  UTC datetime when TP1 was filled (blank if not hit)
+  tp1_fill            FLOAT     Actual TP1 fill price (= tp1_price for limit fills)
+  tp1_partial_pnl     FLOAT     Net PnL from the 50% TP1 partial close
+  tp2_time            DATETIME  UTC datetime when TP2 was filled (blank if not hit)
+  tp2_fill            FLOAT     Actual TP2 fill price
+  tp2_partial_pnl     FLOAT     Net PnL from the 25% TP2 partial close
+  tp3_time            DATETIME  UTC datetime when TP3 was filled (blank if not hit)
+  tp3_fill            FLOAT     Actual TP3 fill price
+  tp3_partial_pnl     FLOAT     Net PnL from the 25% TP3 partial close
+  be_time             DATETIME  UTC datetime when BE stop fired (blank if not hit)
+  be_fill             FLOAT     Actual BE fill price (= entry +/- slippage)
+  be_partial_pnl      FLOAT     Net PnL from the BE close of remaining fraction
+  sl_time             DATETIME  UTC datetime when full-position SL fired (pre-TP1 only)
+  exit_time           DATETIME  UTC datetime of FINAL close (= max of TP/BE/SL/time events)
+  exit_price          FLOAT     Price of the LAST partial close (for compatibility)
+  exit_reason         STR       tp | stop | time
+                                  tp   = TP3 was the final closer
+                                  stop = SL (pre-TP1) or BE (post-TP1) was final closer
+                                  time = time exit closed remaining fraction
+  gross_pnl_usd       FLOAT     Sum of all partial gross PnLs
+  commission_usd      FLOAT     Sum of all partial commissions (round-trip per partial)
+  net_pnl_usd         FLOAT     Total realized net PnL across all partials
+  r_multiple          FLOAT     Sum of partial R-contributions
+                                  TP1 contribution = 0.50 * 0.65 = +0.325R
+                                  TP2 contribution = 0.25 * 1.00 = +0.250R
+                                  TP3 contribution = 0.25 * 1.67 = +0.418R
+                                  Max possible (all 3 fire) = +0.9925R
+                                  Pure stop = -1.000R
+                                  TP1 + BE  = +0.325R
+  mfe_price           FLOAT     Most favorable price reached during trade
+  mae_price           FLOAT     Most adverse price reached during trade
+  mfe_r               FLOAT     (mfe_price - entry_fill) / |entry_fill - stop_price| for long
+  mae_r               FLOAT     (entry_fill - mae_price) / |entry_fill - stop_price| for long
+  equity_before       FLOAT     Equity at trade entry
+  equity_after        FLOAT     Equity at trade close
+  notes               STR       "gap stop" | "A fallback" | "data outage" | blank
+
+Calculated columns (can be derived, stored for convenience):
+  win                 BOOL      net_pnl_usd > 0
+  bars_held           INT       Number of 1H bars from entry to exit
+  pct_return          FLOAT     net_pnl_usd / position_value_usd * 100
+
+MFE/MAE tracking methodology:
+  For each 1H bar while in trade, record the bar high (for MFE on long)
+  and bar low (for MAE on long). Take the max/min across the trade duration.
+  MFE and MAE must be populated at trade close, not real-time.
+  Do not use 15m bars for MFE/MAE — 1H bars only (consistent with backtest).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 3 — METRICS TO TRACK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+3.1  PRIMARY METRICS (updated after every trade)
+──────────────────────────────────────────────────
+
+  Targets are from the 3-year native walk-forward (2023+2024+2025, scaled exit,
+  6,076 trades across AVAX/ADA/SOL/XRP), discounted ~15% for live slippage.
+
+  Metric              Formula                                  Backtest target
+  ──────────────────────────────────────────────────────────────────────────────
+  N_trades            COUNT(closed trades)                     —
+  Win_rate            COUNT(win=TRUE) / N_trades               74.1%  (portfolio)
+  Profit_factor       SUM(net_pnl where win) /                 1.845  (portfolio)
+                      ABS(SUM(net_pnl where loss))
+  Avg_R               MEAN(r_multiple)                         +0.217 (portfolio)
+  Median_R            MEDIAN(r_multiple)                       +0.325 (= TP1+BE)
+  Expectancy_usd      MEAN(net_pnl_usd)                        ~$2.17/trade @10% sizing
+  Std_R               STDEV(r_multiple)                        reference only
+  Max_consecutive_loss COUNT of consecutive negative trades    reference only
+
+  Per-asset 3-year native (Sum R / trades / implied per-asset PF):
+    AVAXUSDT  +331.42R / 1,560 trades  → live PF target >= 1.50
+    ADAUSDT   +303.88R / 1,123 trades  → live PF target >= 1.55
+    SOLUSDT   +312.75R / 1,527 trades  → live PF target >= 1.45
+    XRPUSDT   +371.21R / 1,866 trades  → live PF target >= 1.45
+
+  Live discount rationale:
+    +15% bid/ask spread amplification + Bybit fee variance + occasional
+    gap stops not modelled in 1H bar backtest → conservative reduction
+    from PF 1.85 backtest to ~1.45-1.55 live target.
+
+  Distribution of outcomes (3-year native, 6,076 trades):
+    TP3 (full path)        : 27% — full +0.99R win
+    TP2 -> BE on remainder : 14% — +0.575R win
+    TP1 -> BE on remainder : 26% — +0.325R win  (most common)
+    TP2 -> Time / TP1 ->Time: 3%  — partial fill at time exit
+    Pure stop (no TP1)     : 28% — -1.000R loss
+    Time (no TP1)          : 2%  — small loss
+
+3.2  EXECUTION QUALITY METRICS
+────────────────────────────────
+
+  Metric              Formula                                  Expected range
+  ──────────────────────────────────────────────────────────────────────────────
+  A_pass_rate         (signals passed A) / (raw signals)       72–80%  (backtest=77%)
+  A_fail_rate         (signals failed A) / (raw signals)       20–28%
+  Pullback_rate       (trades with b_pullback=TRUE) /          50–70%
+                      (trades that passed A)
+  Fallback_rate       (trades with b_pullback=FALSE) /         30–50%
+                      (trades that passed A)
+  Avg_entry_vs_ref    MEAN(entry_price_fill - entry_price_raw) Should be < +0.05%
+                      / entry_price_raw * 100                  of reference price
+  Avg_bars_held       MEAN(bars_held)                          8–18 bars
+  Time_exit_rate      COUNT(exit_reason=time) / N_trades       30–50% (estimate)
+  TP_hit_rate         COUNT(exit_reason=tp)   / N_trades       25–40%
+  SL_hit_rate         COUNT(exit_reason=stop) / N_trades       25–35%
+
+3.3  MFE/MAE ANALYSIS
+───────────────────────
+
+  Metric              Formula                               What it tells you
+  ──────────────────────────────────────────────────────────────────────────────
+  Avg_MFE_R           MEAN(mfe_r)                           Avg max reach in R
+  Avg_MAE_R           MEAN(mae_r)                           Avg max drawdown in R
+  MFE_fill_rate       MEAN(mfe_r) / 1.667                   % of TP distance reached
+  MAE_stop_proximity  COUNT(mae_r >= 0.80) / N_trades       Trades close to SL
+  TP_reached_rate     COUNT(mfe_r >= 1.667) / N_trades      Theoretical achievable TP%
+
+  Interpretation:
+    MFE_fill_rate < 0.50 → trades never get close to TP → TP too ambitious, or
+                            signal quality in live is worse than backtest
+    MAE_stop_proximity > 0.40 → many trades nearly stopped out → SL too tight
+    TP_reached_rate >> TP_hit_rate → price reaches TP but you exit early (time)
+                                     → consider extending HOLD_BARS
+
+3.4  REPORTING SCHEDULE
+─────────────────────────
+
+  After each trade  : Update trade log CSV immediately.
+  Daily (end of day): Recalculate all metrics in Section 3.1–3.3.
+  Weekly            : Full statistical summary (mean, median, CI for R).
+  After 30 trades   : Formal promotion evaluation (Section 5).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 4 — DAILY ROUTINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+4.1  SCHEDULE
+───────────────
+
+  The 1H model fires at every 1H bar close (00:00, 01:00, 02:00 ... 23:00 UTC).
+  You must be available to check at the top of each hour OR have an automated
+  pipeline that generates signals and alerts you.
+
+  Minimum viable approach (manual):
+    Set a repeating hourly alert.
+    At each alert, run the signal check (Step 4.2).
+    If no signal: 60 seconds of work, return to other activity.
+    If signal: switch to 15m monitoring for the next 2 hours (Step 4.3).
+
+  If you cannot monitor every hour:
+    Acceptable gaps: up to 2 consecutive hours without checking.
+    Rule: if you miss the check window for a signal, DO NOT enter late.
+          A missed signal is a missed signal — do not chase.
+
+4.2  HOURLY SIGNAL CHECK (2–5 minutes)
+────────────────────────────────────────
+
+  Step 1: At 1H bar close (first few seconds of the new bar), pull confirmed
+          OHLCV data for AVAXUSDT, XRPUSDT, BTCUSDT.
+
+  Step 2: Run feature generation and model prediction.
+          Fastest: pre-built script that reads new bar, recalculates features,
+          outputs P(BUY) for each asset.
+
+  Step 3: For each asset, evaluate:
+          - Is P(BUY) >= 0.55? → LONG candidate
+          - Is P(BUY) <= 0.45? → SHORT candidate
+          - Else: FLAT, move on
+
+  Step 4: For any candidate signal:
+          - Check: is there already an open position on this asset? If yes: SKIP
+          - Check: is ATR/ATR_median >= 0.75? If no (low vol): SKIP, log reason
+          - If candidate survives: begin 15m monitoring (Step 4.3)
+
+  Step 5: For any OPEN positions:
+          - Check if SL or TP was breached during this 1H bar
+          - Check if bar 24 has been reached (time exit)
+          - If exit triggered: record exit in trade log immediately
+
+4.3  15m MONITORING (when signal detected)
+────────────────────────────────────────────
+
+  Context: You have a signal at time T (1H bar close). You now monitor 15m bars.
+
+  T+0m to T+60m — Approach A window (bars 1–4):
+    Watch each 15m bar close.
+    Count aligned bars (close > open for long; close < open for short).
+    At T+60m:
+      aligned < 2 → CANCEL. Log: trade_id, symbol, direction, a_filter_result=fail,
+                               a_aligned_bars=N. No further action.
+      aligned >= 2 → A PASSED. Begin Phase B.
+
+  T+60m to T+120m — Approach B window (bars 5–8):
+    Watch for:
+      Phase 0: Price crossing reference_price (pullback)
+        LONG:  any 15m bar closes below 1H reference → Phase 1
+        SHORT: any 15m bar closes above 1H reference → Phase 1
+      Phase 1: Resumption bar
+        LONG:  next 15m bar closes above its open → ENTER at that close
+        SHORT: next 15m bar closes below its open → ENTER at that close
+
+    If bar 8 (T+120m) closes without pullback+resumption pattern completing:
+      FALLBACK: Enter at the close of bar 8 using 1H reference price.
+
+  At entry: immediately record all entry fields in trade log.
+            Set alerts for SL, TP, and bar-24 time exit on Bybit paper account.
+
+4.4  TRADE MANAGEMENT (while in position)
+────────────────────────────────────────────
+
+  Check at every 1H bar close (same as signal check):
+    1. Read bar high and low
+    2. Update mfe_price (max(current_mfe, bar_high) for long)
+    3. Update mae_price (min(current_mae, bar_low)  for long)
+    4. Check exit triggers in the correct phase priority:
+         PRE_TP1 phase  : SL > TP1 > Time
+         POST_TP1 phase : BE > TP2 > TP3 > Time
+    5. Record any partial fill (TP1, TP2, TP3, BE) with its own timestamp,
+       fill price, and partial PnL. Final trade close is the LAST partial.
+    6. After TP1 fires: ensure Bybit conditional stop is moved to BE (entry).
+    7. Check bar count: if bar 24 with remainder open, time-exit remainder.
+
+  Bybit paper account setup:
+    - 3 limit orders pre-placed at TP1, TP2, TP3 (closes 50%/25%/25%).
+    - 1 conditional stop at SL price.
+    - After TP1 fills: cancel old SL conditional and place new one at BE.
+    - After TP2 fills: nothing to change.
+    - After TP3 fills or BE fills: cancel any remaining orders.
+
+  The manual log is the primary record; Bybit fills are the actual execution.
+
+4.5  END-OF-DAY REVIEW (15–20 minutes)
+────────────────────────────────────────
+
+  Perform once per day at a fixed time (e.g., 00:00 UTC):
+
+  1. Verify trade log: all opened and closed trades from the day are recorded.
+  2. Reconcile with Bybit paper account: fills match your log.
+  3. Update running metrics (Section 3.1–3.2). Record in a daily summary row.
+  4. Flag any anomalies:
+     - Signal fired but no entry was taken → log reason
+     - Entry taken without signal → this should never happen; investigate
+     - A filter pass rate < 60% or > 90% → possible model drift
+  5. Record open positions: current P&L (unrealized), bars held, current MAE.
+
+4.6  WEEKLY REVIEW (30–45 minutes)
+─────────────────────────────────────
+
+  Metrics to compute:
+  - PF per asset (separate) — target >= 1.45 (live-discounted)
+  - Combined PF — target >= 1.55
+  - WR per asset — expected ~70-75% (driven by TP1+BE wins)
+  - A-filter pass rate vs backtest expectation (77%)
+  - Pullback rate vs backtest expectation (~55%)
+  - TP1 hit rate (expect ~70%), TP3 hit rate (expect ~27%)
+  - BE-stop rate (expect ~40-45% of trades trigger BE after TP1)
+  - Pure stop rate (expect ~25-28%)
+  - R distribution: plot histogram (expect bimodal peak at +0.325R and -1R)
+  - MFE fill rate: MEAN(mfe_r) / 1.667
+
+  Decision rule:
+  - If after 4 weeks, any single asset has PF < 1.00 with >= 15 trades:
+    PAUSE that asset. Continue on the other three.
+  - If combined PF < 1.10 after 4 weeks: PAUSE all assets. Run Section 6 diagnosis.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 5 — VALIDATION CRITERIA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+5.1  MINIMUM SAMPLE REQUIREMENTS
+───────────────────────────────────
+
+  Do not make any promotion decision before:
+    Combined: >= 40 closed trades across all 4 assets
+    Per-asset: >= 10 closed trades each (strongly preferred >= 20)
+
+  At the system's expected frequency (from 3-year native: ~500-600 trades/year/asset):
+    AVAX: ~10 trades/week → 20 trades ≈ 2 weeks
+    ADA:  ~7  trades/week → 20 trades ≈ 3 weeks
+    SOL:  ~10 trades/week → 20 trades ≈ 2 weeks
+    XRP:  ~12 trades/week → 20 trades ≈ 2 weeks
+
+  Combined target: 40+ trades in ~2-3 weeks (4 assets running simultaneously).
+
+5.2  PROMOTION CRITERIA (Paper → Live)
+─────────────────────────────────────────
+
+  All of the following must be met simultaneously:
+
+  Criterion                         Threshold         Rationale
+  ────────────────────────────────────────────────────────────────────────────
+  Combined PF                       >= 1.45           Live-discounted vs WF=1.845
+  Win rate                          >= 65.0%          Driven by TP1+BE wins (WF=74.1%)
+  Avg R                             >= +0.15          Positive expectancy in R terms (WF=+0.217R)
+  Median R                          >= +0.20          Most trades should be TP1+BE wins
+  Max DD                            <= 8%             Live-discounted vs WF=5.12%
+  Max consecutive losses            <= 6              Pure-stop streak control
+  A filter pass rate                70-82%            Within backtest range (77%)
+  Pullback rate (given A pass)      45-70%            Within backtest range
+  TP1 hit rate                      >= 60%            Core edge driver
+  Pure stop rate                    <= 32%            Inverse of TP1 hit
+  Sample size                       >= 40 combined    Statistical minimum
+  Duration                          >= 3 weeks        4 active assets fill quickly
+
+  Partial promotion (optional):
+    If 2 of 4 assets meet all thresholds:
+    → Promote those 2 with 0.5x position size each.
+    → Continue paper trading the other 2.
+
+5.3  WARNING STATES (do not promote, do not stop)
+────────────────────────────────────────────────────
+
+  If any of these trigger: continue paper trading for 4 more weeks,
+  then re-evaluate. Do not adjust model parameters.
+
+  Warning                           Trigger
+  ─────────────────────────────────────────────────────────────────────────
+  PF below target but positive      1.10 <= combined PF < 1.45
+  Win rate borderline               55% <= WR < 65%
+  A filter anomaly                  Pass rate < 68% or > 85%
+  TP1 hit rate low                  50% <= TP1_rate < 60%
+  Consecutive losses                4-6 in a row
+
+5.4  DISQUALIFICATION (abort paper trading)
+────────────────────────────────────────────
+
+  Stop immediately and diagnose using Section 6 if:
+
+  Disqualification event            Threshold
+  ─────────────────────────────────────────────────────────────────────────
+  Combined PF severely negative     < 0.90 after 40+ trades
+  Win rate consistently low         < 50% after 40+ trades (edge collapsed)
+  TP1 hit rate consistently low     < 45% (model signals lost edge)
+  A filter never fires              Pass rate > 95% (filter not working)
+  A filter always fires             Pass rate < 50% (filter too aggressive or data issue)
+  Equity drawdown exceeds           -12% from starting paper capital
+  Systematic entry price errors     MEAN(entry vs reference) > 0.5% consistently
+  BE stop fires unexpectedly often  > 60% of TP1-hit trades retrace to BE
+                                    (suggests TP1 too far, market is choppy)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 6 — DETECTING OVERFITTING vs REAL EDGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+6.1  WHAT OVERFITTING LOOKS LIKE IN LIVE TRADING
+───────────────────────────────────────────────────
+
+  Pattern 1: Metric collapse across all assets simultaneously
+    - All 4 assets show PF < 1.10 at the same time, in the same market period.
+    - Interpretation: The model fitted a 2022-2025 macro regime that no longer
+      exists. The 1H RF features are no longer predictive.
+    - Distinguishing signal: A-filter pass rate stays normal (77+/-5%) but
+      trades that pass A still lose. The A filter captures the wrong pattern.
+
+  Pattern 2: A-filter does not differentiate
+    - Trades that FAIL A (if you were tracking them hypothetically) would have
+      a PF similar to trades that PASS A.
+    - A-filter pass rate is wildly different from 77% baseline.
+    - Interpretation: 15m momentum is not correlated with 1H signal quality
+      in current market conditions. The A filter's design assumption broke.
+
+  Pattern 3: Entry price improvement evaporates
+    - Pullback entries show WORSE outcomes than fallback entries.
+    - Interpretation: The pullback pattern (counter-move then resumption) is
+      not present in current market microstructure. The B approach was tuned
+      on a historical pullback rate that no longer occurs.
+
+  Pattern 4: Win rate below 55% persistently (scaled exit)
+    - Scaled exit's WR baseline is ~74% (TP1+BE = small win, pure stop = loss).
+    - Win rate < 55% means TP1 hit rate dropped below 50% — signal quality
+      collapsed. Pure-stop rate spiked above 45%.
+    - Interpretation: Either signal direction quality collapsed, or 15m
+      microstructure makes TP1=0.65R unreachable in current vol regime.
+    - Distinguishing test: check TP1 hit rate directly. If TP1 < 50%, model
+      signal is broken. If TP1 ~70% but BE-stops > 55%, market is choppy
+      (TP1 reaches, then retraces). Different remedies.
+
+  Pattern 5: MFE fill rate < 40%
+    - Price reaches less than 40% of the TP distance before reversing.
+    - Interpretation: The 24H forward return window assumption is wrong for
+      the current period. 24H moves are not trending enough for 2.5×ATR TP.
+
+  Pattern 6: Strong backtest but weak paper trading — timing mismatch
+    - All backtest metrics look good, but paper trades show large slippage.
+    - If MEAN(entry_price_fill / entry_price_raw - 1) > 0.10%:
+      → You are entering on bar close at a worse price than the model assumes.
+      → This is a data latency issue, not a model issue.
+
+6.2  WHAT REAL EDGE LOOKS LIKE
+─────────────────────────────────
+
+  Confirmation signals (all are needed together, not any single one):
+
+  Observation                        Expected range      Confirms
+  ──────────────────────────────────────────────────────────────────────────
+  A-filter pass rate                 72-82%              Model generating quality signals
+  Pullback rate                      48-68%              15m microstructure intact
+  Win rate                           65-78%              TP1+BE wins dominate
+  TP1 hit rate                       65-75%              Scaled-exit core engine working
+  Pure-stop rate                     22-32%              Inverse of TP1 hit rate
+  BE-stop rate (post-TP1)            40-55%              Expected vs backtest ~43%
+  Positive expectancy per trade      > 0                 Edge survives costs
+  PF consistent across assets        >= 1.4 on 3/4       Edge is not asset-specific
+  PF consistent across time          No single month     Edge is not time-specific
+                                     below 1.00
+  MFE fill rate                      > 50%               Price moves toward TP (relaxed
+                                                          since TP1 fires earlier)
+  R distribution: bimodal            Peak at +0.325R     TP1+BE wins + pure stops
+                                     and -1.00R
+  WR consistent between long/short   Within 10% of each  Not directional bias only
+
+6.3  STATISTICAL SIGNIFICANCE CHECK
+──────────────────────────────────────
+
+  At 40 trades you can already get decent confidence. Scaled exit's high WR
+  (~74% expected) makes binomial tests converge faster than v1's 44% WR.
+
+  Binomial test on win rate (null = breakeven WR for the realized R profile):
+    Realized R profile is asymmetric: avg win ~+0.45R, avg loss ~-1.00R
+    Breakeven WR_be = 1.00 / (1.00 + 0.45) = 69%
+    With 40 trades and observed WR >= 75%: reject null at ~80% confidence.
+    With 60 trades and observed WR >= 73%: reject null at ~90% confidence.
+    ~100 trades for 95% confidence at WR=74%.
+
+  Practical threshold instead of p-values:
+    After 40 trades: if avg R > 0.10 and PF > 1.30 -> continue, edge present.
+    After 60 trades: if avg R > 0.15 and PF > 1.40 -> promote conservatively.
+    After 100 trades: use standard t-test on R distribution.
+
+  Formula for 95% CI on expectancy:
+    CI = mean_R +/- (1.96 * std_R / sqrt(N))
+    If lower bound of CI > 0 after N trades -> statistically significant edge.
+
+6.4  DIAGNOSTIC DECISION TREE
+───────────────────────────────
+
+  Paper trading PF < 1.30 after 40+ trades
+  |
+  +-- A-filter pass rate abnormal (< 68% or > 88%)?
+  |    YES -> 15m data quality issue or model not running correctly.
+  |           Check signal generation pipeline for bugs. Not an edge problem.
+  |
+  +-- All 4 assets down simultaneously in the same calendar period?
+  |    YES -> Macro regime shift. The model trained on 2022-2025 does not
+  |           generalize to current macro. Retrain on recent data.
+  |           Add 6 months of new 1H data. Re-run walk-forward.
+  |
+  +-- One asset down, three stable?
+  |    YES -> Asset-specific issue. Pause that asset. Check for structural
+  |           change (volume, liquidity, listing/delisting, correlation change).
+  |
+  +-- TP1 hit rate < 55%?
+  |    YES -> Signal direction quality dropped, OR microstructure changed so
+  |           that 0.65R targets are now too far. Raise BUY_PROB_THRESHOLD
+  |           to 0.57 in backtest first. Do not change live without WF check.
+  |
+  +-- TP1 hit rate ~70% but BE-stop rate > 60%?
+  |    YES -> Choppy market: price hits TP1 then retraces past entry too often.
+  |           Consider lowering TP1 toward 0.50R OR widening BE to +0.10R offset.
+  |           Both are backtest-only changes; do NOT modify live without WF.
+  |
+  +-- MFE fill rate < 40% (post-TP1)?
+  |    YES -> TP3 ambitious for current regime; many TP1-hit trades never
+  |           reach TP3. Acceptable as long as edge is positive (scaled exit
+  |           tolerates this). Consider lowering TP3 toward 1.40R in backtest.
+  |
+  +-- Pure-stop rate > 38%?
+  |    YES -> Entries too early or in wrong direction. Same remedy as low
+  |           TP1 hit rate: raise BUY_PROB_THRESHOLD or revisit 15m-A filter.
+  │
+  └─ None of the above?
+       → Statistical variance. Continue trading. At 30 trades you do not
+         have enough data to distinguish bad luck from bad model.
+         Minimum: wait until 50 trades before any model change.
+
+6.5  WHAT NOT TO DO
+─────────────────────
+
+  - Do not re-optimize parameters because paper trading is disappointing.
+    Changing parameters after seeing results is classic overfitting.
+
+  - Do not add a new filter because you see a pattern in 10 trades.
+    Any pattern in < 50 trades is noise.
+
+  - Do not change SL, TP1, TP2, TP3, or BE level because a few trades
+    "almost" reached them. The scaled-exit parameters were chosen via WF
+    sweep — do not chase short-term anecdotes.
+
+  - Do not switch from 15m-AB to baseline because A is filtering too much.
+    The A filter's value is demonstrated OOS. Do not remove it based on
+    short-term results.
+
+  - Do not skip the BE stop manually because "this trade looks like it
+    will continue running". The BE stop is part of the edge construction;
+    skipping it = manually re-running an experiment with different rules.
+
+  - Do not close TP3 remainder early because the trade is taking too long.
+    Time exit handles that automatically at bar 24.
+
+  - Do not compare your paper PF to the full in-sample backtest PF.
+    The correct comparison is the 3-year native WF PF (1.85 combined).
+    Live target after discount is ~1.45-1.55. Expect drift in either
+    direction in the first 40 trades.
+
+================================================================================
+  APPENDIX - REFERENCE NUMBERS  (updated for v2 / scaled exit)
+================================================================================
+
+  Break-even WR at the scaled-exit realized R profile:
+    avg win ~+0.45R, avg loss = -1.00R
+    WR_be = avg_loss / (avg_win + avg_loss) = 1.00 / 1.45 = 69.0%
+    Backtest WR = 74.1% -> ~5pp above breakeven.
+
+  Expected R per trade at WR=74%, scaled exit:
+    E[R] = 0.74 * 0.45 + 0.26 * (-1.0) = +0.073 (live-discounted)
+    Backtest E[R] = +0.217R (no live discount).
+
+  Position sizing at $10,000 starting capital:
+    Position value = $10,000 * 0.10 = $1,000 per trade
+    Dollar risk (1R) = $1,000 * (1.5 ATR / entry_price)
+    Example at AVAX $25.00, ATR=$0.50:
+      sl_dist = $0.75 (1.5*ATR), 1R = $30 per trade
+      TP1 = $25.4875 ($19.50 on 50% partial)
+      TP2 = $25.7500 ($18.75 on 25% partial)
+      TP3 = $26.2500 ($31.25 on 25% partial)
+      Full TP3 path:    +$69.50 gross before commissions
+      TP1+BE worst:     +$9.75 - small BE cost = ~+$8.5 net
+      Pure stop:        -$30.00 gross
+
+  3-year native WF PF (validated 2026-05-10, scaled exit, exit_mode="scaled"):
+    AVAXUSDT: Sum R = +331.42R / 1,560 trades  (live target PF >= 1.50)
+    ADAUSDT:  Sum R = +303.88R / 1,123 trades  (live target PF >= 1.55)
+    SOLUSDT:  Sum R = +312.75R / 1,527 trades  (live target PF >= 1.45)
+    XRPUSDT:  Sum R = +371.21R / 1,866 trades  (live target PF >= 1.45)
+    Combined: PF=1.845, WR=74.1%, MaxDD=5.12%, CAGR=+59% ($10K/10% sizing)
+
+  Expected signal frequency (from 3-year native, ~365 days/year):
+    AVAX: 1,560 trades / 1095d = 1.42 trades/day = ~10/week
+    ADA:  1,123 trades / 1095d = 1.03 trades/day = ~7/week
+    SOL:  1,527 trades / 1095d = 1.40 trades/day = ~10/week
+    XRP:  1,866 trades / 1095d = 1.70 trades/day = ~12/week
+    Combined portfolio: ~5.5 trades/day = ~40/week
+    -> Reach 40-trade promotion threshold in ~1 week of active markets.
+
+  Note: Daily frequency in paper trading may differ from backtest. The model
+  is retrained on fresh data. Signal frequency is a function of market
+  regime, not a fixed constant.
+
+  Cross-reference to code (single source of truth):
+    config.py             : BACKTEST_EXIT_MODE, SCALED_TP1_R, SCALED_TP2_R,
+                            SCALED_TP3_R, SCALED_TP1_FRAC, SCALED_TP2_FRAC,
+                            SCALED_TP3_FRAC, STOP_LOSS_ATR_MULT,
+                            TAKE_PROFIT_ATR_MULT, HOLD_BARS, POSITION_SIZE_PCT
+    paper_trading/
+      config_live.py      : EXIT_MODE = "scaled", same SCALED_* params
+    backtest/engine.py    : native scaled-exit state machine
+    paper_trading/
+      trade_manager.py    : live scaled-exit state machine (paired with engine)
+
+================================================================================
+  END OF PROTOCOL
+  Last updated: 2026-05-10  (v2 — native scaled-exit integration)
+================================================================================
