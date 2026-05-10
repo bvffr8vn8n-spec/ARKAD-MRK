@@ -5,3 +5,13 @@ data/
 reports/
 .claude/
 experiments/*.csv
+secrets.py
+paper_trading/secrets.py
+
+# Runtime artefacts (regeneratable)
+paper_trading/state.json
+paper_trading/*.log
+*.log
+
+# Experiment output dumps (regeneratable from scripts)
+experiments/realistic_exec_logs/

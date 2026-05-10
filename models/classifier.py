@@ -50,6 +50,9 @@ _NON_FEATURE_COLS = {
     "fwd_return", "fwd_return_atr", "label",
     # Regime and session columns — analysis/filter layers, not learned features
     "trend", "vol_regime", "regime_gate", "session",
+    # 4H context layers — categorical strings, used for signal gating only
+    "bias_4h",       # SMA crossover context (proven, WF PF = 0.988)
+    "bias_4h_adx",   # ADX context (Design A, experimental)
 }
 
 
