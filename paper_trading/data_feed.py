@@ -1,0 +1,160 @@
+"""
+paper_trading/data_feed.py — Live market data feed backed by the Bybit V5 API.
+
+Wraps data.bybit_loader.fetch_klines with:
+  - Sensible default windows (WARMUP_1H_BARS for 1H, FETCH_15M_BARS for 15m)
+  - Suppressed page-by-page print output from the downloader
+  - Error handling: returns None on failure (caller decides what to do)
+
+Usage
+-----
+    feed = LiveFeed()
+    df_1h  = feed.get_1h_bars("AVAXUSDT")    # last WARMUP_1H_BARS + 1 bars
+    df_15m = feed.get_15m_bars("AVAXUSDT")   # last FETCH_15M_BARS bars
+"""
+
+import io
+import sys
+from datetime import datetime, timedelta
+from typing import Optional
+
+import pandas as pd
+
+from paper_trading import config_live
+from paper_trading.logger import get_logger
+
+log = get_logger()
+
+
+class LiveFeed:
+    """Thin wrapper around fetch_klines for live-polling use."""
+
+    def get_1h_bars(
+        self,
+        symbol: str,
+        n_bars: int = config_live.WARMUP_1H_BARS,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Fetch the most recent `n_bars` completed 1H bars for `symbol`.
+
+        Returns a DataFrame (DatetimeIndex "date", cols: open/high/low/close/volume)
+        sorted ascending, or None on error.
+
+        The end of the range is set to `now - 1 minute` to avoid pulling a
+        still-forming candle. The start is set far enough back to guarantee
+        at least n_bars of history.
+        """
+        return self._fetch(symbol, config_live.INTERVAL_1H, n_bars, bar_minutes=60)
+
+    def get_15m_bars(
+        self,
+        symbol: str,
+        n_bars: int = config_live.FETCH_15M_BARS,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Fetch the most recent `n_bars` completed 15m bars for `symbol`.
+
+        Returns None on error.
+        """
+        return self._fetch(symbol, config_live.INTERVAL_15M, n_bars, bar_minutes=15)
+
+    def get_ticker_price(self, symbol: str) -> Optional[dict]:
+        """
+        Fetch the current real-time market price from the Bybit ticker endpoint.
+
+        This is the ONLY correct source for paper-trade entry prices.
+        Candle close prices (from get_1h_bars / get_15m_bars) reflect prices
+        that were valid at bar-close time, not at the moment of trade entry.
+
+        Returns a dict with keys:
+            last : float  — last traded price
+            bid  : float  — best bid (you receive this when selling / going short)
+            ask  : float  — best ask (you pay this when buying / going long)
+
+        Returns None on any network or API error (caller must handle and skip entry).
+
+        Endpoint
+        --------
+        GET https://api.bybit.com/v5/market/tickers
+            ?category=linear&symbol=<SYMBOL>
+        """
+        import requests
+        from data.bybit_loader import _auth_headers
+        try:
+            params = {
+                "category": config_live.BYBIT_CATEGORY,
+                "symbol":   symbol.upper(),
+            }
+            resp = requests.get(
+                "https://api.bybit.com/v5/market/tickers",
+                params=params,
+                headers=_auth_headers(params),
+                timeout=10,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            if body.get("retCode") != 0:
+                log.error(
+                    "Ticker API error for %s: retCode=%s  msg=%s",
+                    symbol, body.get("retCode"), body.get("retMsg"),
+                )
+                return None
+            items = body["result"]["list"]
+            if not items:
+                log.warning("Ticker API returned empty list for %s", symbol)
+                return None
+            t = items[0]
+            return {
+                "last": float(t["lastPrice"]),
+                "bid":  float(t["bid1Price"]),
+                "ask":  float(t["ask1Price"]),
+            }
+        except Exception as exc:
+            log.error("get_ticker_price failed for %s: %s", symbol, exc)
+            return None
+
+    # ── Private ───────────────────────────────────────────────────────────────
+
+    def _fetch(
+        self,
+        symbol: str,
+        interval: str,
+        n_bars: int,
+        bar_minutes: int,
+    ) -> Optional[pd.DataFrame]:
+        """Generic fetcher: calculates a time range that covers n_bars and downloads."""
+        # Import here to avoid circular imports at module level
+        from data.bybit_loader import fetch_klines
+
+        now = datetime.utcnow()
+        # End: 2 minutes before now to avoid the currently-forming bar
+        end   = now - timedelta(minutes=2)
+        # Start: generous lookback so we always get >= n_bars
+        start = end - timedelta(minutes=bar_minutes * (n_bars + 5))
+
+        try:
+            # fetch_klines prints one line per API page — suppress that noise
+            buf = io.StringIO()
+            old_stdout = sys.stdout
+            sys.stdout = buf
+            try:
+                df = fetch_klines(
+                    symbol   = symbol,
+                    category = config_live.BYBIT_CATEGORY,
+                    interval = interval,
+                    start    = start,
+                    end      = end,
+                )
+            finally:
+                sys.stdout = old_stdout
+
+            if df is None or len(df) == 0:
+                log.warning("Empty response for %s %s-min", symbol, bar_minutes)
+                return None
+
+            # Return only the last n_bars
+            return df.iloc[-n_bars:].copy()
+
+        except Exception as exc:
+            log.error("fetch_klines failed for %s %s: %s", symbol, interval, exc)
+            return None

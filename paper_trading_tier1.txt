@@ -1,0 +1,492 @@
+================================================================================
+  ARKAD MRK — TIER 1 PAPER TRADING OPERATIONS
+  Assets : AVAXUSDT  ADAUSDT  SOLUSDT  XRPUSDT
+  System : 1H CalibratedRF + 15m-AB (Approach A+B)
+  Date   : 2026-03-19
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 1 — HOURLY OPERATIONAL CHECKLIST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Run this at every confirmed 1H bar close (top of each hour, UTC).
+Total time if no signal: under 2 minutes.
+
+  STEP  ACTION                                             IF TRUE → NEXT
+  ──────────────────────────────────────────────────────────────────────────
+  1     Confirm previous bar is CLOSED on Bybit            —
+        (next bar has opened; don't act on forming bar)
+
+  2     Pull latest 1H OHLCV for all 4 assets              —
+        AVAXUSDT, ADAUSDT, SOLUSDT, XRPUSDT
+
+  3     Run signal generator                                —
+        → get P(BUY) per asset
+
+  4     For each asset, evaluate:                           Signal candidate
+        LONG  if P(BUY)  >= 0.55
+        SHORT if P(BUY)  <= 0.45
+        FLAT  → skip this asset, move to Step 5
+
+  5     For each signal candidate:
+        a. ATR_ratio = current_ATR / ATR_median(72)
+           If ATR_ratio < 0.75 → SKIP (low vol), log: blocked_low_vol
+        b. Is there already an open position on this asset?
+           If YES → SKIP, log: blocked_existing_position
+        c. If passed (a) and (b) → begin 15m monitoring (Section 2)
+
+  6     For each OPEN position:
+        a. Read bar HIGH and LOW just closed
+        b. LONG:  if bar_low  <= stop_price → EXIT at stop  (Priority 1)
+                  if bar_high >= tp_price   → EXIT at tp    (Priority 2)
+        c. SHORT: if bar_high >= stop_price → EXIT at stop  (Priority 1)
+                  if bar_low  <= tp_price   → EXIT at tp    (Priority 2)
+        d. Count bars held since entry:
+           if bars_held >= 24 → TIME EXIT at this bar's close (Priority 3)
+        e. If exit triggered:
+           - Record exit_time, exit_price, exit_reason
+           - Compute net_pnl, r_multiple, mfe_r, mae_r
+           - Fill trade log row completely
+
+  7     Update MFE/MAE for all open positions:
+        LONG : mfe_price = max(mfe_price, bar_high)
+               mae_price = min(mae_price, bar_low)
+        SHORT: mfe_price = min(mfe_price, bar_low)   [most favorable low]
+               mae_price = max(mae_price, bar_high)  [most adverse high]
+
+  8     Log timestamp + "no signal" if nothing happened   —
+        (maintain a continuous hourly audit trail)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 2 — 15m MONITORING WINDOW (when signal detected at time T)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Record at signal detection: symbol, direction, signal_time, atr_1h, reference_price = 1H close.
+
+────────────────────────────────────────────────────────────────────
+  APPROACH A  (T+0m to T+60m  |  15m bars 1, 2, 3, 4)
+────────────────────────────────────────────────────────────────────
+
+  At each 15m bar close, record:
+    bar_close > bar_open  (for LONG) → aligned
+    bar_close < bar_open  (for SHORT) → aligned
+
+  At T+60m (bar 4 closes):
+    aligned_count < 2 → CANCEL
+      log: a_filter_result = fail, a_aligned_bars = N
+      Stop monitoring. No trade.
+
+    aligned_count >= 2 → A PASSED
+      log: a_filter_result = pass, a_aligned_bars = N
+      Begin Approach B immediately.
+
+  MISSED DATA RULE:
+    If 15m feed is unavailable for any bar in window 1–4:
+    → CANCEL trade. Log: a_filter_result = no_data.
+    Do not fall back to 1H entry.
+
+────────────────────────────────────────────────────────────────────
+  APPROACH B  (T+60m to T+120m  |  15m bars 5, 6, 7, 8)
+────────────────────────────────────────────────────────────────────
+
+  State: WAITING_PULLBACK (initial)
+
+  At each 15m bar close:
+
+    If state = WAITING_PULLBACK:
+      LONG:  bar_close < reference_price  → state = WAITING_RESUMPTION
+      SHORT: bar_close > reference_price  → state = WAITING_RESUMPTION
+
+    If state = WAITING_RESUMPTION:
+      LONG:  bar_close > bar_open  → ENTER here
+      SHORT: bar_close < bar_open  → ENTER here
+
+  FALLBACK (bar 8 closes, no pattern completed):
+    → ENTER at close of bar 8
+    → Use reference_price as pre-slippage entry price
+    → Log: b_pullback_found = FALSE
+
+  ENTRY FILL (after pattern or fallback):
+    pre_slip = pullback_bar_close  (or reference_price if fallback)
+    LONG  fill = pre_slip * 1.0002
+    SHORT fill = pre_slip * 0.9998
+    → log: entry_time, entry_price_fill, b_pullback_found
+
+────────────────────────────────────────────────────────────────────
+  CALCULATE AND RECORD AT ENTRY
+────────────────────────────────────────────────────────────────────
+
+  LONG:
+    stop_price  = entry_price_fill - 1.5 * atr_1h
+    tp_price    = entry_price_fill + 2.5 * atr_1h
+    risk_1r_usd = (entry_price_fill - stop_price) * units
+    max_bar     = entry_bar_index + 24
+
+  SHORT:
+    stop_price  = entry_price_fill + 1.5 * atr_1h
+    tp_price    = entry_price_fill - 2.5 * atr_1h
+    risk_1r_usd = (stop_price - entry_price_fill) * units
+    max_bar     = entry_bar_index + 24
+
+  units = (equity * 0.10) / entry_price_fill
+
+  Set Bybit paper SL and TP alerts immediately.
+  Record stop_price and tp_price in trade log.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 3 — TRADE LOG TEMPLATE  (paper_trades_tier1.csv)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+One row per CLOSED trade. Populate at trade close.
+
+  Column              Type    Fill when       Allowed values / notes
+  ────────────────────────────────────────────────────────────────────────
+  trade_id            INT     signal          sequential 1, 2, 3, ...
+  symbol              STR     signal          AVAXUSDT | ADAUSDT | SOLUSDT | XRPUSDT
+  signal_time         DT/UTC  signal          e.g. 2026-03-19 14:00:00
+  direction           STR     signal          long | short
+  a_filter_result     STR     T+60m           pass | fail | no_data
+  a_aligned_bars      INT     T+60m           0 | 1 | 2 | 3 | 4  (blank if no_data)
+  b_pullback_found    BOOL    entry           TRUE | FALSE | N/A (if A failed)
+  entry_time          DT/UTC  entry           blank if A failed
+  entry_price_fill    FLOAT   entry           post-slippage fill; blank if A failed
+  atr_1h              FLOAT   signal          14-bar 1H ATR at signal bar close
+  stop_price          FLOAT   entry           calculated from entry_fill + ATR
+  tp_price            FLOAT   entry           calculated from entry_fill + ATR
+  exit_time           DT/UTC  exit            blank until closed
+  exit_price          FLOAT   exit            actual fill (SL/TP/time rule)
+  exit_reason         STR     exit            stop | tp | time
+  net_pnl_usd         FLOAT   exit            gross_pnl - commission
+  r_multiple          FLOAT   exit            net_pnl_usd / risk_1r_usd
+  mfe_r               FLOAT   exit            (peak_favorable - entry) / risk_1r for long
+  mae_r               FLOAT   exit            (entry - trough) / risk_1r for long
+  notes               STR     anytime         gap_stop | data_outage | missed_check | blank
+
+  r_multiple formula:
+    LONG:  r_multiple = (exit_price - entry_price_fill) / (entry_price_fill - stop_price)
+    SHORT: r_multiple = (entry_price_fill - exit_price) / (stop_price - entry_price_fill)
+    Deduct commission before computing: net_pnl = gross_pnl - (entry+exit)*units*0.001
+
+  mfe_r (long):  (max_bar_high_during_trade - entry_price_fill) / (entry_price_fill - stop_price)
+  mae_r (long):  (entry_price_fill - min_bar_low_during_trade)  / (entry_price_fill - stop_price)
+  For short:     flip the numerator direction accordingly.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 4 — LIVE BENCHMARKS PER ASSET
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Source: Walk-forward validation (10-asset run, 2026-03-19).
+Primary reference is Win3 (most recent OOS window, closest to live).
+
+4.1  WF EXPECTATIONS
+
+  Asset       WF PF   Win1   Win2   Win3   WF Trades  Base WF PF  AB Lift
+  ────────────────────────────────────────────────────────────────────────
+  AVAXUSDT    1.337   1.375  1.383  1.254      398       0.930     +0.407
+  ADAUSDT     1.327   1.120  1.546  1.317      409       0.892     +0.436
+  SOLUSDT     1.134   1.081  1.213  1.109      198       0.819     +0.316
+  XRPUSDT     1.083   0.978  1.201  1.071      627       0.795     +0.288
+
+  Combined    1.145   ~all windows > 1.0       1632       —         —
+
+  Win3 is the anchor. All 4 assets have Win3 >= 1.0. This is the minimum
+  expected in live trading. Underperformance vs Win3 is the first warning signal.
+
+4.2  MINIMUM ACCEPTABLE LIVE PF (per asset, after 20+ trades)
+
+  Asset       Live PF minimum   Basis
+  ────────────────────────────────────────────────────────────────────────
+  AVAXUSDT    >= 1.10           Discounted from Win3=1.254
+  ADAUSDT     >= 1.10           Discounted from Win3=1.317
+  SOLUSDT     >= 1.00           Discounted from Win3=1.109
+  XRPUSDT     >= 0.95           Discounted from Win3=1.071 (weakest of 4)
+  Combined    >= 1.05           Minimum viable portfolio PF
+
+  Discount logic: 5–10% below Win3 to account for live execution slippage,
+  data latency, and retraining differences vs backtest.
+
+4.3  EXPECTED SIGNAL FREQUENCY (from test set, 290 days)
+
+  Asset       Trades  Per day  Per week  Weeks to 20 trades
+  ────────────────────────────────────────────────────────────────────────
+  AVAXUSDT      328     1.13     7.9          2.5
+  ADAUSDT       274     0.94     6.6          3.0
+  SOLUSDT       378     1.30     9.1          2.2
+  XRPUSDT       417     1.44    10.1          2.0
+  Combined     1397     4.82    33.7          ~1 week for 30 combined
+
+  Note: frequency varies with market regime. These are historical averages.
+  Expect +/- 40% variation week to week.
+
+4.4  EXECUTION QUALITY BENCHMARKS
+
+  Metric                Expected range    Alarm threshold
+  ────────────────────────────────────────────────────────────────────────
+  A-filter pass rate    72 – 80%          < 65% or > 87%
+  Pullback rate         48 – 68%          < 40% or > 75%
+  Win rate              40 – 52%          < 34% after 30+ trades
+  Avg bars held         8 – 18            > 22 (signals mostly time-exiting)
+  TP hit rate           25 – 40%          < 18%
+  SL hit rate           25 – 35%          > 48%
+  Time exit rate        25 – 45%          > 55% (TP never reached)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 5 — DAILY OPERATING LOOP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+5.1  TOP OF EVERY HOUR  (2–4 min if no signal, up to 2h if signal active)
+
+  00:xx UTC — execute Section 1 checklist completely
+  Record in hourly log: timestamp | signals_checked | any_signal | open_positions
+
+5.2  WHEN A SIGNAL IS DETECTED  (switch to 15m mode)
+
+  Immediately upon detecting a signal at 1H close:
+
+    1. Open Bybit chart for the signaled asset on 15m timeframe
+    2. Note signal_time, direction, reference_price (1H close), atr_1h
+    3. Start A-window timer: 4 × 15m = 60 min
+
+  At T+15m, T+30m, T+45m: record each 15m bar close vs open
+  At T+60m:
+    aligned_count >= 2 → proceed to B, stay on chart
+    aligned_count < 2  → log A_fail, close chart, return to normal
+
+  During B window (T+60m to T+120m):
+    Monitor each 15m bar close.
+    When pullback+resumption or fallback triggers:
+    → Record entry immediately (entry_time, entry_price_fill)
+    → Calculate and record stop_price, tp_price
+    → Place SL and TP orders on Bybit paper account
+    → Log entry row in trade log (leave exit columns blank)
+
+5.3  WHILE A POSITION IS OPEN
+
+  At every 1H close (Section 1, Step 6):
+    Check SL/TP breach.
+    Check bar count (bars_held = current_bar_index - entry_bar_index).
+    Update mfe_price and mae_price.
+
+  Between hourly checks:
+    Rely on Bybit paper account SL/TP alerts as backup.
+    If SL/TP hits between hourly checks:
+    → Record actual fill from Bybit
+    → Note "between_hourly_checks" in notes field
+
+5.4  END OF DAY  (fixed UTC time — use 00:00 UTC daily)
+
+  Duration: 15–20 minutes.
+
+  STEP  ACTION
+  ──────────────────────────────────────────────────────────────────────
+  1     Reconcile trade log with Bybit paper account order history.
+        Every fill in Bybit should have a matching row in trade log.
+        Every trade log row should have a matching Bybit fill.
+        Flag any discrepancy.
+
+  2     Complete any trade rows that closed today:
+        exit_time, exit_price, exit_reason, net_pnl_usd, r_multiple,
+        mfe_r, mae_r.
+
+  3     Update running daily summary row:
+
+        Date | Closed trades | Open positions | Combined PF (cumulative)
+             | Avg R today   | A-pass rate today | Equity
+
+  4     Check alarm thresholds (Section 4.4):
+        If any metric outside expected range:
+        → Note it. Do not adjust parameters.
+        → If alarm persists 3+ days: escalate to weekly review.
+
+  5     Record open positions status:
+        symbol | entry_time | bars_held | current_mae_r
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 6 — WEEKLY REVIEW TEMPLATE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Complete once per week. Use Friday 00:00 UTC or any consistent day.
+
+6.1  SUMMARY BLOCK
+
+  Week #    : ___
+  Period    : ___ to ___  (UTC dates)
+  Open pos  : ___ (list symbol + bars_held)
+
+6.2  TRADE COUNTS
+
+  Metric                AVAX   ADA    SOL    XRP    Combined
+  ──────────────────────────────────────────────────────────
+  Signals detected        _      _      _      _        _
+  A-filter passed         _      _      _      _        _
+  A-filter failed         _      _      _      _        _
+  Trades entered          _      _      _      _        _
+  Trades closed           _      _      _      _        _
+  Trades open (EOW)       _      _      _      _        _
+
+6.3  PERFORMANCE METRICS
+
+  Metric          AVAX    ADA     SOL     XRP     Combined   Target
+  ────────────────────────────────────────────────────────────────────────
+  Profit Factor    _       _       _       _         _       >= 1.05
+  Win Rate         _       _       _       _         _       >= 38%
+  Avg R            _       _       _       _         _       >= +0.10
+  Expectancy $     _       _       _       _         _       > 0
+  Max consec loss  _       _       _       _         _       <= 8
+  Equity change    _       _       _       _         _       > 0 cumulative
+
+6.4  EXECUTION QUALITY METRICS
+
+  Metric                  This week   Cumulative    Expected
+  ──────────────────────────────────────────────────────────────────
+  A-pass rate             _           _             72–80%
+  Pullback rate           _           _             48–68%
+  Fallback rate           _           _             32–52%
+  TP hit rate             _           _             25–40%
+  SL hit rate             _           _             25–35%
+  Time exit rate          _           _             25–45%
+  Avg bars held           _           _             8–18
+  MFE fill rate           _           _             > 60%
+    (= avg MFE_R / 1.667)
+
+  MFE fill rate calculation:
+    = MEAN(mfe_r for all closed trades) / 1.667
+    Interpretation:
+      < 0.50 → price rarely reaches half of TP distance → TP too aggressive for regime
+      0.50–0.70 → expected range
+      > 0.70 → price consistently pushes toward TP (favorable)
+
+6.5  ASSET PAUSE CRITERIA
+
+  Pause an individual asset (stop new entries, keep managing open trades) if:
+
+  Condition                                         Threshold
+  ──────────────────────────────────────────────────────────────────────
+  Asset PF after 15+ trades                         < 0.70
+  A-pass rate for this asset (10+ signals)          < 60% or > 90%
+  3 consecutive A-pass trades all stopped out       —
+  SL hit rate for this asset (10+ trades)           > 55%
+
+  When paused:
+    - Log pause date and reason
+    - Continue monitoring (check signals, log A results) but do not enter
+    - Reassess after 4 weeks or 20 additional signal observations
+    - Do not change model parameters
+
+  Combined pause (pause all 4 assets) if:
+    Combined PF < 0.75 after 40+ closed trades
+
+6.6  WEEKLY NARRATIVE (4 bullets max)
+
+  1. Performance vs Win3 benchmark: [above / below / in range]
+  2. Most anomalous metric this week and likely cause:
+  3. Any asset showing consistent deviation from expected A-pass rate:
+  4. Decision for next week: [continue as-is / pause asset X / flag for diagnosis]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 7 — GO / NO-GO THRESHOLDS  (Paper → Real Money)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+7.1  MINIMUM REQUIREMENTS (all must be satisfied before evaluation)
+
+  Requirement                       Threshold
+  ────────────────────────────────────────────────────────────────────────
+  Minimum closed trades combined    >= 30
+  Minimum closed trades per asset   >= 8 each  (or clearly explain gaps)
+  Minimum calendar duration         >= 6 weeks
+  No active asset pauses            All 4 assets running at evaluation time
+
+  At expected frequency (~33 trades/week combined):
+    30 trades reached in ~1 week.
+    The calendar minimum (6 weeks) is the binding constraint.
+
+7.2  GO CONDITIONS (all must be met simultaneously)
+
+  Metric                              GO threshold
+  ────────────────────────────────────────────────────────────────────────
+  Combined PF                         >= 1.10
+  Win rate                            >= 38.0%
+  Avg R (combined)                    >= +0.10
+  A-pass rate                         70 – 82%
+  MFE fill rate                       >= 0.50
+  Max consecutive losses              <= 8
+  Equity drawdown from peak           <= -8%
+  Per-asset PF (each individually)    >= 0.90 on at least 3 of 4 assets
+  No open active pause on any asset   True
+
+  All 7 conditions met → authorized to begin live trading at 25% of
+  intended position size for the first 2 weeks of live trading.
+
+  After 2 weeks live at 25% size with no degradation:
+    → Step to 50% of intended position size.
+  After 2 more weeks at 50% size with no degradation:
+    → Step to 100%.
+
+7.3  NO-GO CONDITIONS (any one blocks promotion indefinitely)
+
+  Condition                           Threshold           Action
+  ────────────────────────────────────────────────────────────────────────
+  Combined PF                         < 0.90              Continue paper, 4 more weeks
+  Win rate                            < 33%               Continue paper, diagnose
+  Max consecutive losses              > 10                Continue paper, diagnose
+  Any single asset PF                 < 0.65              Pause that asset, diagnose
+  Combined equity drawdown            > -12%              Full stop, diagnose
+  A-pass rate                         < 60% or > 90%      Signal pipeline check required
+  MFE fill rate                       < 0.35              TP miscalibration — backtest first
+
+  If any NO-GO condition triggers: run the overfitting/regime diagnostic
+  from paper_trading_protocol.txt Section 6.4 before any other action.
+
+7.4  PARTIAL PROMOTION (if assets diverge)
+
+  If 3 of 4 assets individually meet GO conditions but 1 does not:
+    → Promote the 3 qualifying assets at 25% size.
+    → Continue paper trading the failing asset.
+    → Reassess failing asset after 4 weeks (15+ additional trades).
+
+  Do not promote XRPUSDT alone without at least one of AVAX or ADA.
+  Reason: XRP has the lowest Win3 (1.071) of the 4 and most borderline history.
+
+7.5  REFERENCE BENCHMARKS AT EVALUATION TIME
+
+  At go/no-go evaluation, compare live metrics to Win3 benchmarks:
+
+  Asset       Win3 PF  Live PF min  Live PF target   Live WR min
+  ────────────────────────────────────────────────────────────────────────
+  AVAXUSDT    1.254       1.10          1.20           38%
+  ADAUSDT     1.317       1.10          1.20           38%
+  SOLUSDT     1.109       1.00          1.10           38%
+  XRPUSDT     1.071       0.95          1.05           38%
+
+  "Min" = floor for promotion. "Target" = expected if edge is intact.
+  If live PF is above Target: do not raise position size prematurely.
+  Wait for the 6-week minimum regardless.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  APPENDIX — QUICK REFERENCE NUMBERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  R:R ratio           = 2.5 / 1.5 = 1.667
+  Break-even WR       = 1 / (1 + 1.667) = 37.5%
+  Expected R per trade = 0.441 * 1.667 + 0.559 * (-1.0) = +0.176  [at WR=44.1%]
+  Position size       = 10% of equity per trade
+  Max simultaneous    = 4 positions = 40% of equity
+  Commission          = 0.10% round-trip (deducted from P&L)
+  Entry slippage      = 0.02% per side (market order)
+  TP slippage         = 0.00% (limit order)
+  SL slippage         = 0.02% (market order, adverse fill)
+
+  SL fill (long):  stop_price * 0.9998
+  TP fill (long):  tp_price  * 1.0000
+  Time fill (long):bar_close * 0.9998
+
+  Per-trade dollar risk (example):
+    Asset price $1.00, ATR=$0.03, equity=$10,000
+    Units = ($10,000 * 0.10) / ($1.00 * 1.0002) = 999.8 units
+    Dollar risk 1R = 999.8 * (1.5 * 0.03) = $45.0
+    TP gain = $45.0 * 1.667 = $75.0 per winner
+
+================================================================================
+  END OF DOCUMENT
+  Last updated: 2026-03-19
+================================================================================
