@@ -8,6 +8,7 @@ Usage:
 
 import argparse
 import math
+import os
 import sys
 
 import config
@@ -26,6 +27,19 @@ from experiments.threshold_sweep import run_threshold_sweep
 from experiments.walk_forward import run_walk_forward
 from experiments.regime_analysis import run_regime_analysis, run_session_analysis
 from features.intraday import add_5m_features
+from features.context_4h import add_4h_context, apply_4h_context_filter, print_4h_bias_stats
+from features.execution_15m import (
+    load_15m_data, load_5m_as_15m, annotate_signals_AB, coverage_stats, print_coverage_stats,
+)
+
+
+def _fmt_val(v, fmt: str) -> str:
+    try:
+        if v is None or (isinstance(v, float) and not math.isfinite(v)):
+            return "N/A"
+        return format(v, fmt)
+    except (TypeError, ValueError):
+        return "N/A"
 
 
 def _strategy_score(m: dict) -> float:
@@ -57,8 +71,9 @@ def _strategy_score(m: dict) -> float:
 def parse_args():
     parser = argparse.ArgumentParser(description="ARKAD MRK — Trading Research Pipeline")
     parser.add_argument("--data",   required=True, help="Path to 1H OHLCV CSV file")
-    parser.add_argument("--data5m", default=None,  help="Path to 5m OHLCV CSV (optional, enables intraday features)")
-    parser.add_argument("--symbol", default="ASSET", help="Symbol label for reports")
+    parser.add_argument("--data5m",  default=None, help="Path to 5m OHLCV CSV (optional, enables intraday features)")
+    parser.add_argument("--data15m", default=None, help="Path to 15m or 5m OHLCV CSV (optional, enables 15m-AB execution layer)")
+    parser.add_argument("--symbol",  default="ASSET", help="Symbol label for reports")
     return parser.parse_args()
 
 
@@ -190,7 +205,7 @@ def _save_strategy_comparison(
     print(f"  Saved: {out_path}\n")
 
 
-def run_pipeline(data_path: str, symbol: str, data5m_path: str = None):
+def run_pipeline(data_path: str, symbol: str, data5m_path: str = None, data15m_path: str = None):
     print(f"\n{'='*60}")
     print(f"  ARKAD MRK Research Pipeline  |  {symbol}")
     print(f"{'='*60}\n")
@@ -223,6 +238,13 @@ def run_pipeline(data_path: str, symbol: str, data5m_path: str = None):
           f"us={session_counts.get('us', 0)}  "
           f"late={session_counts.get('late', 0)}\n")
 
+    # 3b. 4H context layer (optional)
+    if config.USE_4H_CONTEXT:
+        print("[3b/9] Adding 4H directional context"
+              f" (mode={config.CONTEXT_4H_MODE})...")
+        df = add_4h_context(df)
+        print_4h_bias_stats(df)
+
     # 4. Add labels
     print("[4/9] Creating forward-return labels...")
     df = add_labels(df)
@@ -244,6 +266,11 @@ def run_pipeline(data_path: str, symbol: str, data5m_path: str = None):
     signals_df = generate_signals(model, feature_cols, df)
     # Save raw signal counts before trend filter overwrites the 'signal' column.
     _raw_signal = signals_df["signal"].copy()
+    # Optional 4H context gate: applied before all other filters.
+    # Blocks long signals that contradict the 4H bear bias (and vice versa).
+    if config.USE_4H_CONTEXT:
+        signals_df = apply_4h_context_filter(signals_df)
+        signals_df["signal"] = signals_df["signal_4h_filtered"]
     # Trend gate applied first as a hard filter — only ALLOWED_TRENDS pass through.
     # All downstream filters (vol, regime, session) operate on trend-gated signals.
     signals_df = apply_trend_filter(signals_df)
@@ -293,6 +320,14 @@ def run_pipeline(data_path: str, symbol: str, data5m_path: str = None):
         "Regime-Aware":     (m_regf, trades_regf, eq_regf),
         "Session-Filtered": (m_sesf, trades_sesf, eq_sesf),
     }
+    # Keep a reference to each strategy's signals DataFrame so we can apply
+    # the 15m-AB execution layer later without re-running the model.
+    _signals_lookup = {
+        "Raw":              raw_df,
+        "Vol-Filtered":     volf_df,
+        "Regime-Aware":     regf_df,
+        "Session-Filtered": sesf_df,
+    }
     for name, (m, _, _) in backtest_map.items():
         m["_score"] = _strategy_score(m)
 
@@ -331,7 +366,47 @@ def run_pipeline(data_path: str, symbol: str, data5m_path: str = None):
     print_report(symbol, final_trades, final_eq)
     save_report(symbol, final_trades, final_eq)
 
+    # ── Optional 15m-AB execution layer ──────────────────────────────────────
+    # Enabled by passing --data15m (15m CSV) or --data15m (5m CSV, auto-resampled).
+    # Applied to the best 4-strategy result.  Reported separately — does not
+    # override the main report; use the printed comparison to decide.
+    if data15m_path:
+        print(f"\n{'-'*60}")
+        print(f"  15m-AB Execution Layer  (applied to: {best_name})")
+        print(f"{'-'*60}")
+        is_5m = "5m" in os.path.basename(data15m_path)
+        df_15m = load_5m_as_15m(data15m_path) if is_5m else load_15m_data(data15m_path)
+        print(f"  15m data: {len(df_15m):,} bars  "
+              f"({df_15m.index[0].date()} to {df_15m.index[-1].date()})")
+
+        best_signals = _signals_lookup[best_name]
+        ann = annotate_signals_AB(best_signals, df_15m)
+        ann["signal"] = ann["signal_15m_A"]
+
+        trades_ab, eq_ab = run_backtest(ann)
+        m_ab = compute_metrics(trades_ab, eq_ab)
+
+        stats = coverage_stats(best_signals, ann, df_15m, window_label="15m-AB test")
+        print_coverage_stats(stats)
+
+        # Side-by-side comparison: baseline best vs 15m-AB
+        n_base = int(m.get("n_trades", 0) if (m := backtest_map[best_name][0]) else 0)
+        n_ab   = int(m_ab.get("n_trades", 0))
+        print(f"\n  {'Metric':<22} {'Baseline (' + best_name + ')':>20} {'15m-AB':>12}")
+        print(f"  {'-'*56}")
+        for lbl, key, fmt in [
+            ("Trades",        "n_trades",      "d"),
+            ("Win rate",      "win_rate",      ".1%"),
+            ("Profit factor", "profit_factor", ".3f"),
+            ("Expectancy $",  "expectancy",    "+.2f"),
+            ("Max drawdown",  "max_drawdown",  ".2f"),
+        ]:
+            v_base = backtest_map[best_name][0].get(key)
+            v_ab   = m_ab.get(key)
+            print(f"  {lbl:<22} {str(_fmt_val(v_base, fmt)):>20} {str(_fmt_val(v_ab, fmt)):>12}")
+        print(f"  {'-'*56}")
+
 
 if __name__ == "__main__":
     args = parse_args()
-    run_pipeline(args.data, args.symbol, args.data5m)
+    run_pipeline(args.data, args.symbol, args.data5m, args.data15m)

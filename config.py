@@ -124,6 +124,55 @@ HOLD_BARS            = 24
 STOP_LOSS_ATR_MULT   = 1.5         # Stop loss:   1.5 × ATR
 TAKE_PROFIT_ATR_MULT = 2.5         # Take profit: 2.5 × ATR
 
+# ── Exit mode (single TP vs scaled exit) ─────────────────────────────────────
+# "single" — classic single TP at TAKE_PROFIT_ATR_MULT × ATR (legacy)
+# "scaled" — three partial exits + BE stop after TP1 (DEFAULT, mirrors paper_trading)
+#
+# Validated on 2023-2025 walk-forward (native engine, AVAX/ADA/SOL/XRP):
+#                  single        scaled        delta
+#   trades         5,136         6,076         +940 (BE-exits free position earlier)
+#   WR             48.8%         74.1%         +25.3pp
+#   Avg R          +0.212R       +0.217R       +0.005R
+#   Sum R          +1090.62R     +1319.26R     +228.64R
+#   PF             1.426         1.845         +0.419
+#   Max DD         17.98%        5.12%         -12.86pp  ← 71% drawdown reduction
+#   CAGR ($10K/10%) +40.3%        +59.0%        +18.75pp
+BACKTEST_EXIT_MODE   = "scaled"
+
+# Scaled exit parameters (used only when BACKTEST_EXIT_MODE == "scaled").
+# Must match paper_trading/config_live.py for backtest ↔ live parity.
+SCALED_TP1_R         = 0.65        # TP1 level in R-units (close TP1_FRAC)
+SCALED_TP2_R         = 1.00        # TP2 level in R-units
+SCALED_TP3_R         = 1.67        # TP3 level = TAKE_PROFIT_ATR_MULT/STOP_LOSS_ATR_MULT
+SCALED_TP1_FRAC      = 0.50        # Fraction closed at TP1
+SCALED_TP2_FRAC      = 0.25        # Fraction closed at TP2
+SCALED_TP3_FRAC      = 0.25        # Fraction closed at TP3 (= 1 − TP1 − TP2)
+
+# ── 4H Context Layer — SMA crossover (proven, WF PF = 0.988) ─────────────────
+# Set USE_4H_CONTEXT=True in the main pipeline to gate 1H signals by a 4H
+# directional bias (bull / bear / neutral).  See features/context_4h.py.
+#
+# SMA windows expressed in 4H bars:
+#   fast = 20 × 4H = 80  1H bars ≈ 3.3 days
+#   slow = 50 × 4H = 200 1H bars ≈ 8.3 days
+USE_4H_CONTEXT      = False       # True = enable 4H bias gate in main pipeline
+CONTEXT_4H_MODE     = "strict"    # "strict"  = only aligned direction (no neutral)
+                                   # "relaxed" = aligned + neutral allowed
+CONTEXT_4H_SMA_FAST = 20          # 4H SMA fast window (in 4H bars)
+CONTEXT_4H_SMA_SLOW = 50          # 4H SMA slow window (in 4H bars)
+
+# ── 4H Context Layer — ADX gate (Design A, experimental) ─────────────────────
+# See features/context_4h_adx.py and experiments/context_4h_adx_test.py.
+#
+# bull   : close > SMA-slow  AND  ADX > ADX_THRESHOLD  (trending up)
+# bear   : close < SMA-slow  AND  ADX > ADX_THRESHOLD  (trending down)
+# neutral: ADX <= ADX_THRESHOLD  (confirmed range — not warmup/unknown)
+#
+# In "adx_range" filter mode, neutral bars are allowed for both directions
+# (hypothesis: low-ADX range bars are valid mean-reversion setups).
+CONTEXT_4H_ADX_WINDOW    = 14    # Wilder's ADX period in 4H bars (~2.3 days)
+CONTEXT_4H_ADX_THRESHOLD = 20    # Classic trend/range boundary (Wilder's standard)
+
 # ── Experiments ──────────────────────────────────────────────────────────────
 REPORTS_DIR        = "reports"
 EXPERIMENTS_DIR    = "experiments"
