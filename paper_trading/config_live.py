@@ -32,11 +32,19 @@ INTERVAL_15M   = "15"       # 15-minute bars
 # Must be > SMA-200 warmup (200) + ATR-14 + RSI-14 + safety margin.
 WARMUP_1H_BARS = 320
 
-# How many recent 15m bars to fetch per poll (covers last ~5 hours).
-FETCH_15M_BARS = 25
+# How many recent 1H / 15m bars to fetch per poll (live polling, NOT warmup).
+# We only need enough to cover any gap since the last processed bar; one new
+# bar is the normal case, a handful of bars covers brief outages.  Smaller =
+# less bandwidth per request, no impact on the trading logic.
+FETCH_1H_BARS_LIVE  = 5
+FETCH_15M_BARS_LIVE = 10
+FETCH_15M_BARS      = FETCH_15M_BARS_LIVE   # back-compat alias
 
 # Poll interval in seconds — how often the main loop wakes up.
-POLL_INTERVAL_S = 30
+# Trading granularity is 15m bars; 60 s gives a comfortable 15x margin.
+# Larger interval also halves the total Bybit request rate vs. the previous
+# 30 s setting (which was tripping account-level rate limits).
+POLL_INTERVAL_S = 60
 
 # Retrain the signal model every N newly processed 1H bars (0 = never retrain).
 # At startup the model is always trained from the full historical CSV.

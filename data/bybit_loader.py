@@ -143,10 +143,14 @@ def fetch_klines(
             "limit":    limit,
         }
 
+        # Public market endpoint — do NOT send auth headers.
+        # Bybit applies a stricter ACCOUNT-level rate limit on authenticated
+        # requests; the IP-level limit on unauthenticated public market data
+        # is far more generous and is what we want here.
         response = request_with_retry(
             BYBIT_KLINE_URL,
             params=params,
-            headers=_auth_headers(params),
+            headers={},
             timeout=20,
         )
         if response is None:
@@ -162,9 +166,24 @@ def fetch_klines(
         response.raise_for_status()
 
         body = response.json()
-        if body.get("retCode") != 0:
+        rc = body.get("retCode")
+        # 10006 = Bybit rate limit ("Too many visits").  Retrying immediately
+        # makes it worse — trip the circuit breaker for a long cooldown so the
+        # whole process backs off cleanly.
+        if rc == 10006:
+            BYBIT_BREAKER.trip(
+                reason="retCode 10006 (rate limit)",
+                cooldown_s=300.0,   # 5-minute lockout
+            )
+            log.error(
+                "Bybit rate limit hit (10006) on %s — circuit breaker tripped "
+                "for 5 min; aborting fetch.",
+                symbol,
+            )
+            break
+        if rc != 0:
             raise RuntimeError(
-                f"Bybit API error {body.get('retCode')}: {body.get('retMsg')}"
+                f"Bybit API error {rc}: {body.get('retMsg')}"
             )
 
         candles = body["result"]["list"]  # list of lists, descending order

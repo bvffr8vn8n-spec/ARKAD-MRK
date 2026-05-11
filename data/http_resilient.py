@@ -97,6 +97,8 @@ class CircuitBreaker:
         self._state            = "CLOSED"
         self._consecutive_fail = 0
         self._opened_at        = 0.0
+        # Current cooldown (may be overridden by trip() with a custom value).
+        self._active_cooldown  = cooldown_s
 
     @property
     def state(self) -> str:
@@ -109,7 +111,7 @@ class CircuitBreaker:
         Transitions OPEN -> HALF_OPEN automatically when cooldown has elapsed.
         """
         if self._state == "OPEN":
-            if (time.monotonic() - self._opened_at) >= self.cooldown_s:
+            if (time.monotonic() - self._opened_at) >= self._active_cooldown:
                 self._state = "HALF_OPEN"
                 log.warning(
                     "[circuit:%s] cooldown elapsed -> HALF_OPEN (probe next request)",
@@ -118,6 +120,24 @@ class CircuitBreaker:
                 return True
             return False
         return True   # CLOSED or HALF_OPEN
+
+    def trip(self, reason: str, cooldown_s: Optional[float] = None) -> None:
+        """
+        Forcibly open the breaker, optionally with a custom cooldown.
+
+        Used by callers that detect application-level rate limits (e.g. Bybit
+        retCode 10006) where retrying would only make the problem worse.
+        Calling trip() bypasses the failure-count threshold entirely.
+        """
+        self._state           = "OPEN"
+        self._opened_at       = time.monotonic()
+        self._active_cooldown = cooldown_s if cooldown_s is not None else self.cooldown_s
+        # Pretend we've hit the threshold so subsequent successes can fully reset
+        self._consecutive_fail = max(self._consecutive_fail, self.failure_threshold)
+        log.error(
+            "[circuit:%s] tripped (reason=%s) -> OPEN for %.0fs",
+            self.name, reason, self._active_cooldown,
+        )
 
     def record_success(self) -> None:
         """Reset the breaker on any successful response."""
@@ -128,6 +148,7 @@ class CircuitBreaker:
             )
         self._state            = "CLOSED"
         self._consecutive_fail = 0
+        self._active_cooldown  = self.cooldown_s   # reset to default for next trip
 
     def record_failure(self) -> None:
         """Count a failed request.  Opens the breaker once threshold hit."""

@@ -32,29 +32,34 @@ class LiveFeed:
     def get_1h_bars(
         self,
         symbol: str,
-        n_bars: int = config_live.WARMUP_1H_BARS,
+        n_bars: int = config_live.FETCH_1H_BARS_LIVE,
     ) -> Optional[pd.DataFrame]:
         """
         Fetch the most recent `n_bars` completed 1H bars for `symbol`.
 
+        Default of FETCH_1H_BARS_LIVE (~5 bars) is enough to cover the new
+        bar each tick plus a few-hour outage cushion.  The full WARMUP_1H_BARS
+        history is loaded once at startup by the signal engine from the local
+        CSV — we do NOT re-fetch 13 days of bars on every poll.
+
         Returns a DataFrame (DatetimeIndex "date", cols: open/high/low/close/volume)
         sorted ascending, or None on error.
 
-        The end of the range is set to `now - 1 minute` to avoid pulling a
-        still-forming candle. The start is set far enough back to guarantee
-        at least n_bars of history.
+        The end of the range is set to `now - 2 minutes` to avoid pulling a
+        still-forming candle.
         """
         return self._fetch(symbol, config_live.INTERVAL_1H, n_bars, bar_minutes=60)
 
     def get_15m_bars(
         self,
         symbol: str,
-        n_bars: int = config_live.FETCH_15M_BARS,
+        n_bars: int = config_live.FETCH_15M_BARS_LIVE,
     ) -> Optional[pd.DataFrame]:
         """
         Fetch the most recent `n_bars` completed 15m bars for `symbol`.
 
-        Returns None on error.
+        Default of FETCH_15M_BARS_LIVE (~10 bars = 2.5 h) covers normal tick
+        cadence plus a few-hour gap.  Returns None on error.
         """
         return self._fetch(symbol, config_live.INTERVAL_15M, n_bars, bar_minutes=15)
 
@@ -80,17 +85,18 @@ class LiveFeed:
         GET https://api.bybit.com/v5/market/tickers
             ?category=linear&symbol=<SYMBOL>
         """
-        from data.bybit_loader import _auth_headers
-        from data.http_resilient import request_with_retry
+        from data.http_resilient import request_with_retry, BYBIT_BREAKER
         try:
             params = {
                 "category": config_live.BYBIT_CATEGORY,
                 "symbol":   symbol.upper(),
             }
+            # Public ticker endpoint — no auth headers (see bybit_loader.py
+            # for the rate-limit rationale).
             resp = request_with_retry(
                 "https://api.bybit.com/v5/market/tickers",
                 params=params,
-                headers=_auth_headers(params),
+                headers={},
                 timeout=10,
             )
             if resp is None:
@@ -100,10 +106,21 @@ class LiveFeed:
                 return None
             resp.raise_for_status()
             body = resp.json()
-            if body.get("retCode") != 0:
+            rc = body.get("retCode")
+            if rc == 10006:
+                BYBIT_BREAKER.trip(
+                    reason="retCode 10006 (ticker rate limit)",
+                    cooldown_s=300.0,
+                )
+                log.error(
+                    "Bybit rate limit (10006) on ticker %s — circuit breaker "
+                    "tripped for 5 min.", symbol,
+                )
+                return None
+            if rc != 0:
                 log.error(
                     "Ticker API error for %s: retCode=%s  msg=%s",
-                    symbol, body.get("retCode"), body.get("retMsg"),
+                    symbol, rc, body.get("retMsg"),
                 )
                 return None
             items = body["result"]["list"]
