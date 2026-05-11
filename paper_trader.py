@@ -35,7 +35,9 @@ Output files
 import argparse
 import json
 import os
+import signal
 import sys
+import time
 
 # Force UTF-8 console output on Windows (avoids cp1251 codec errors)
 if hasattr(sys.stdout, "reconfigure"):
@@ -49,12 +51,38 @@ if _ROOT not in sys.path:
 from paper_trading.logger import get_logger
 from paper_trading.config_live import ASSETS, INITIAL_CAPITAL, STATE_FILE, CSV_FILE
 from paper_trading.data_feed import LiveFeed
+from paper_trading.runtime import request_shutdown
 from paper_trading.signal_engine import SignalEngine
 from paper_trading.state_store import StateStore
 from paper_trading.csv_writer import CsvWriter
 from paper_trading.poller import run_poll_loop
 
 log = get_logger()
+
+
+def _install_signal_handlers() -> None:
+    """
+    Install SIGINT / SIGTERM handlers so the poll loop can shut down cleanly.
+
+    On signal: sets the runtime shutdown flag.  The poll loop notices it
+    between ticks, exits the loop normally, persists final state, and returns.
+
+    On Windows only SIGINT (Ctrl-C) is reliably delivered.  SIGTERM works on
+    Linux/macOS where systemd / docker / kill send it on container stop.
+    """
+    def _handler(signum, _frame):
+        sig_name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
+        log.warning("Received %s — requesting graceful shutdown.", sig_name)
+        request_shutdown(reason=sig_name)
+
+    signal.signal(signal.SIGINT, _handler)
+
+    if hasattr(signal, "SIGTERM"):
+        try:
+            signal.signal(signal.SIGTERM, _handler)
+        except (ValueError, AttributeError):
+            # SIGTERM unavailable on some Windows Python builds; ignore.
+            pass
 
 
 def _parse_args() -> argparse.Namespace:
@@ -146,8 +174,12 @@ def main() -> None:
         return
 
     # ── Normal startup ────────────────────────────────────────────────────────
+    _install_signal_handlers()
+
+    startup_ts = time.time()
     log.info("=" * 60)
     log.info("  ARKAD MRK — Paper Trader  starting up")
+    log.info("  PID       : %d", os.getpid())
     log.info("  Assets    : %s", ", ".join(ASSETS))
     log.info("  State file: %s", STATE_FILE)
     log.info("  CSV log   : %s", CSV_FILE)
@@ -177,10 +209,22 @@ def main() -> None:
     engine.train_all()
     log.info("All models trained.  Entering poll loop.")
 
-    # Run main loop (blocks until CTRL+C)
-    run_poll_loop(engine, store, feed, csv_writer)
-
-    log.info("Paper trader stopped.")
+    # Run main loop.  Returns when:
+    #   - SIGINT / SIGTERM received -> runtime.request_shutdown() flips flag
+    #   - KeyboardInterrupt at top level
+    #   - Uncaught exception (will propagate out, logged by the except below)
+    try:
+        run_poll_loop(engine, store, feed, csv_writer)
+    except Exception:
+        log.exception("Poll loop terminated by unhandled exception.")
+        raise
+    finally:
+        uptime_s = time.time() - startup_ts
+        log.info("=" * 60)
+        log.info("  Paper Trader stopped.  Uptime: %.1fs (%.2f h)",
+                 uptime_s, uptime_s / 3600)
+        log.info("  Final state saved at: %s", STATE_FILE)
+        log.info("=" * 60)
 
 
 if __name__ == "__main__":

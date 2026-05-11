@@ -72,25 +72,32 @@ class LiveFeed:
             ask  : float  — best ask (you pay this when buying / going long)
 
         Returns None on any network or API error (caller must handle and skip entry).
+        Uses the resilient HTTP layer: retries on transient failures, respects
+        the global Bybit circuit breaker.
 
         Endpoint
         --------
         GET https://api.bybit.com/v5/market/tickers
             ?category=linear&symbol=<SYMBOL>
         """
-        import requests
         from data.bybit_loader import _auth_headers
+        from data.http_resilient import request_with_retry
         try:
             params = {
                 "category": config_live.BYBIT_CATEGORY,
                 "symbol":   symbol.upper(),
             }
-            resp = requests.get(
+            resp = request_with_retry(
                 "https://api.bybit.com/v5/market/tickers",
                 params=params,
                 headers=_auth_headers(params),
                 timeout=10,
             )
+            if resp is None:
+                # Retries exhausted or circuit breaker is OPEN.
+                log.warning("get_ticker_price: no response for %s "
+                            "(retries exhausted or breaker open)", symbol)
+                return None
             resp.raise_for_status()
             body = resp.json()
             if body.get("retCode") != 0:

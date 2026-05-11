@@ -55,12 +55,19 @@ from paper_trading import config_live
 from paper_trading.csv_writer import CsvWriter
 from paper_trading.data_feed import LiveFeed
 from paper_trading.logger import get_logger
+from paper_trading.runtime import is_shutdown_requested, shutdown_reason
 from paper_trading.signal_engine import SignalEngine
 from paper_trading.state_machine import MonitorState, advance_monitor
 from paper_trading.state_store import StateStore
 from paper_trading.trade_manager import TradeManager, TradeState
 
 log = get_logger()
+
+# If we hit this many consecutive _tick() exceptions, log loudly and pause for
+# a longer cooldown rather than spinning hot. Set high enough that ordinary
+# Bybit hiccups (handled by http_resilient) never trip it.
+_MAX_CONSECUTIVE_TICK_ERRORS = 50
+_TICK_ERROR_COOLDOWN_S       = 60.0
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
@@ -81,14 +88,35 @@ def run_poll_loop(
     log.info("Poll interval: %ds | 1H warmup bars: %d | assets: %d",
              config_live.POLL_INTERVAL_S, config_live.WARMUP_1H_BARS, len(config_live.ASSETS))
 
+    consecutive_errors = 0
+
     while True:
+        # Honour external shutdown request between ticks (SIGTERM / SIGINT
+        # handler in paper_trader.py sets the flag in paper_trading.runtime).
+        if is_shutdown_requested():
+            log.info("Shutdown requested (%s) — exiting poll loop cleanly.",
+                     shutdown_reason() or "no reason")
+            break
+
         try:
             _tick(engine, store, feed, csv_writer)
+            consecutive_errors = 0   # reset on any successful tick
         except KeyboardInterrupt:
             log.info("Keyboard interrupt received — shutting down.")
             break
         except Exception as exc:
-            log.error("Unexpected error in tick: %s", exc, exc_info=True)
+            consecutive_errors += 1
+            log.error("Unexpected error in tick (consecutive=%d): %s",
+                      consecutive_errors, exc, exc_info=True)
+
+            if consecutive_errors >= _MAX_CONSECUTIVE_TICK_ERRORS:
+                log.critical(
+                    "Hit %d consecutive tick failures — pausing %.0fs before "
+                    "next attempt to avoid log spam.  Investigate root cause.",
+                    consecutive_errors, _TICK_ERROR_COOLDOWN_S,
+                )
+                time.sleep(_TICK_ERROR_COOLDOWN_S)
+                continue
 
         time.sleep(config_live.POLL_INTERVAL_S)
 

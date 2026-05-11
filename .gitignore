@@ -1,17 +1,28 @@
 __pycache__/
 *.pyc
 *.pyo
-data/
+
+# Historical OHLCV and other generated data — too large for git.
+# The Python loaders / downloaders in data/ are still tracked.
+data/*.csv
+data/*.pkl
+data/*.parquet
+data/sample.csv
+
 reports/
 .claude/
 experiments/*.csv
 secrets.py
 paper_trading/secrets.py
 
+# Local v1 artefact archives (kept outside git)
+archive_v1/
+
 # Runtime artefacts (regeneratable)
 paper_trading/state.json
 paper_trading/*.log
 *.log
+paper_trades_tier1.csv
 
 # Experiment output dumps (regeneratable from scripts)
 experiments/realistic_exec_logs/

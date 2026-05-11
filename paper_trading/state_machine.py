@@ -37,6 +37,7 @@ special encoding.  Datetimes are stored as ISO strings.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
@@ -89,7 +90,15 @@ class MonitorState:
 
     @classmethod
     def from_dict(cls, d: dict) -> "MonitorState":
-        return cls(**d)
+        """
+        Rebuild a MonitorState from its JSON dict.
+
+        Unknown keys are ignored (forward compat) and missing keys fall back
+        to dataclass defaults (backward compat).  This makes restart recovery
+        robust across schema migrations.
+        """
+        known = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
 
 
 # ── State machine update ──────────────────────────────────────────────────────

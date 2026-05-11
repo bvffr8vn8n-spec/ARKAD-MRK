@@ -1,0 +1,68 @@
+# ARKAD MRK — Paper Trader systemd unit
+#
+# Install:
+#   sudo cp deploy/arkad-paper-trader.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now arkad-paper-trader
+#
+# Operate:
+#   sudo systemctl status arkad-paper-trader
+#   sudo journalctl -u arkad-paper-trader -f
+#   sudo systemctl restart arkad-paper-trader
+#   sudo systemctl stop arkad-paper-trader   # sends SIGTERM, triggers graceful shutdown
+#
+# Edit User=, WorkingDirectory=, ExecStart= for your server layout.
+# See deploy/README.md for full deployment notes.
+
+[Unit]
+Description=ARKAD MRK Paper Trader (Bybit 24/7 signal engine)
+Documentation=https://github.com/bvffr8vn8n-spec/ARKAD-MRK
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# ── User / paths (edit for your server) ─────────────────────────────────────
+User=arkad
+Group=arkad
+WorkingDirectory=/opt/arkad-mrk
+
+# ── Command ─────────────────────────────────────────────────────────────────
+# Adjust the python interpreter path to your venv.
+ExecStart=/opt/arkad-mrk/.venv/bin/python paper_trader.py
+
+# ── Restart policy ──────────────────────────────────────────────────────────
+# Crash -> wait 30s -> restart.  StartLimitBurst=10 in 1h prevents tight loops.
+Restart=on-failure
+RestartSec=30s
+StartLimitIntervalSec=3600
+StartLimitBurst=10
+
+# ── Graceful shutdown ───────────────────────────────────────────────────────
+# SIGTERM lets paper_trader.py exit its poll loop cleanly and persist state.
+# 60s is plenty: a single tick finishes in well under 5s.
+KillSignal=SIGTERM
+TimeoutStopSec=60s
+
+# ── Logging ─────────────────────────────────────────────────────────────────
+# Use journald for the captured stdout/stderr.  paper_trading/paper_trader.log
+# still has its own rotating file log.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arkad-paper-trader
+
+# ── Hardening (safe defaults) ───────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/arkad-mrk
+
+# ── Resource limits ─────────────────────────────────────────────────────────
+# Model training takes ~30 sec at startup; 2GB is comfortable for 4 assets.
+MemoryMax=2G
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target
