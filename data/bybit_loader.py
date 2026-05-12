@@ -131,6 +131,10 @@ def fetch_klines(
     all_candles: list[list] = []
     page_end_ms = end_ms
     page_num    = 0
+    # Tracks whether the loop exited due to transport abort (breaker open
+    # or retries exhausted) vs. genuine end-of-data.  Used to emit a clearer
+    # error message at the end.
+    aborted_by_transport = False
 
     while True:
         page_num += 1
@@ -161,6 +165,7 @@ def fetch_klines(
                 "fetch_klines: giving up page %d for %s after retries/breaker",
                 page_num, symbol,
             )
+            aborted_by_transport = True
             break
 
         response.raise_for_status()
@@ -180,6 +185,7 @@ def fetch_klines(
                 "for 5 min; aborting fetch.",
                 symbol,
             )
+            aborted_by_transport = True
             break
         if rc != 0:
             raise RuntimeError(
@@ -213,6 +219,20 @@ def fetch_klines(
         time.sleep(_PAGE_DELAY_S)
 
     if not all_candles:
+        if aborted_by_transport:
+            # Transient: breaker open, retries exhausted, or 10006 lockout.
+            # Return empty DataFrame so the caller treats it like "no new
+            # data this tick" (warning only) rather than a hard error.
+            log.debug(
+                "fetch_klines: no candles for %s (transport aborted; will retry next tick)",
+                symbol,
+            )
+            empty = pd.DataFrame(
+                columns=["open", "high", "low", "close", "volume"]
+            )
+            empty.index.name = "date"
+            return empty
+        # Genuine empty range from Bybit (bad symbol, range before listing, etc.)
         raise ValueError(
             f"No candles returned for {symbol} interval={interval} "
             f"[{_ms_to_str(start_ms)} - {_ms_to_str(end_ms)}]. "

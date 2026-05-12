@@ -183,6 +183,11 @@ class CircuitOpenError(RuntimeError):
     """Raised when the breaker is OPEN and a request was blocked."""
 
 
+# Generic, polite User-Agent.  Some CDN / WAF setups treat header-less requests
+# more aggressively, so we send a stable identifier even on public endpoints.
+_USER_AGENT = "arkad-paper-trader/1.0 (+https://github.com/bvffr8vn8n-spec/ARKAD-MRK)"
+
+
 def request_with_retry(
     url: str,
     *,
@@ -201,9 +206,19 @@ def request_with_retry(
     requests.Response on success (status_code 2xx-4xx-except-retryable).
     None if breaker is OPEN, or all retries exhausted.
 
-    A 4xx response (other than retryable codes) is returned to the caller so it
-    can read .status_code / .text; it does NOT trigger a retry.  Only transport
-    errors and retryable status codes (429, 5xx, etc.) consume retry budget.
+    Breaker accounting
+    ------------------
+    The circuit breaker is updated ONCE per LOGICAL request, not per retry
+    attempt.  Intermediate retries do not inflate the failure counter — a
+    single logical request that exhausts all retries counts as exactly one
+    failure.  This avoids opening the breaker after a couple of bursty
+    transient errors (e.g. brief Vultr -> Bybit packet loss), which would
+    cascade into "No candles returned" errors for the rest of the poll.
+
+    A 4xx response (other than retryable codes) is returned to the caller so
+    it can read .status_code / .text; it does NOT trigger a retry.  Only
+    transport errors and retryable status codes (429, 5xx, etc.) consume
+    retry budget.
     """
     if not breaker.allow_request():
         log.warning(
@@ -211,6 +226,12 @@ def request_with_retry(
             breaker.name, url,
         )
         return None
+
+    # Always send a benign User-Agent header so we look like a normal client
+    # to Bybit's CDN.  Caller-provided headers override / extend it.
+    full_headers: dict = {"User-Agent": _USER_AGENT}
+    if headers:
+        full_headers.update(headers)
 
     delay = retry.base_delay_s
     last_err: Optional[str] = None
@@ -221,40 +242,45 @@ def request_with_retry(
                 method,
                 url,
                 params=params,
-                headers=headers,
+                headers=full_headers,
                 timeout=timeout,
             )
 
-            # Retryable HTTP status: count as failure, back off, retry
+            # Retryable HTTP status: log + back off (do NOT touch breaker
+            # here; we only record the breaker outcome once retries finish).
             if resp.status_code in RETRYABLE_STATUSES:
                 last_err = f"HTTP {resp.status_code}"
-                breaker.record_failure()
                 _log_retry(attempt, retry, url, last_err)
                 if attempt < retry.max_retries:
                     time.sleep(delay)
                     delay = min(delay * retry.backoff_mult, retry.max_delay_s)
                     continue
+                # Exhausted -> ONE failure for the breaker.
+                breaker.record_failure()
                 log.error(
                     "Request to %s exhausted %d retries (last error: %s)",
                     url, retry.max_retries, last_err,
                 )
                 return None
 
-            # Any other response (2xx-4xx not in retryable set): success path
+            # Any other response (2xx-4xx not in retryable set): success path.
+            # Even a 4xx is a definitive answer from Bybit -- the network is
+            # fine, the breaker should not penalise this.
             breaker.record_success()
             return resp
 
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout,
                 requests.exceptions.ChunkedEncodingError) as exc:
-            # Transport-level errors are retryable
+            # Transport-level errors are retryable.  Defer breaker accounting
+            # until retries are exhausted.
             last_err = type(exc).__name__
-            breaker.record_failure()
             _log_retry(attempt, retry, url, last_err)
             if attempt < retry.max_retries:
                 time.sleep(delay)
                 delay = min(delay * retry.backoff_mult, retry.max_delay_s)
                 continue
+            breaker.record_failure()
             log.error(
                 "Request to %s exhausted %d retries (last error: %s)",
                 url, retry.max_retries, last_err,
@@ -262,14 +288,14 @@ def request_with_retry(
             return None
 
         except requests.exceptions.RequestException as exc:
-            # Unknown but transport-related: retry once more, then give up
+            # Unknown but transport-related: retry once more, then give up.
             last_err = f"{type(exc).__name__}: {exc}"
-            breaker.record_failure()
             _log_retry(attempt, retry, url, last_err)
             if attempt < retry.max_retries:
                 time.sleep(delay)
                 delay = min(delay * retry.backoff_mult, retry.max_delay_s)
                 continue
+            breaker.record_failure()
             log.error(
                 "Request to %s exhausted %d retries (last error: %s)",
                 url, retry.max_retries, last_err,
