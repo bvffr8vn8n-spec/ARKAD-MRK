@@ -20,6 +20,15 @@ Documentation=https://github.com/bvffr8vn8n-spec/ARKAD-MRK
 After=network-online.target
 Wants=network-online.target
 
+# Restart-rate limit MUST live in [Unit], not [Service].  Without these keys
+# being in the right section, systemd silently ignores them and the rate
+# limit becomes the daemon-wide default (5 starts in 10s) -- not what we want.
+# These two together mean: tolerate up to 10 restart attempts per hour; if
+# the service crashes more than 10 times in 3600s, systemd refuses to keep
+# restarting it (use `systemctl reset-failed` to clear the counter).
+StartLimitIntervalSec=3600
+StartLimitBurst=10
+
 [Service]
 Type=simple
 
@@ -33,11 +42,10 @@ WorkingDirectory=/opt/arkad-mrk
 ExecStart=/opt/arkad-mrk/.venv/bin/python paper_trader.py
 
 # ── Restart policy ──────────────────────────────────────────────────────────
-# Crash -> wait 30s -> restart.  StartLimitBurst=10 in 1h prevents tight loops.
+# Crash -> wait 30s -> restart.  Rate limit (StartLimitIntervalSec /
+# StartLimitBurst) is defined in [Unit] above.
 Restart=on-failure
 RestartSec=30s
-StartLimitIntervalSec=3600
-StartLimitBurst=10
 
 # ── Graceful shutdown ───────────────────────────────────────────────────────
 # SIGTERM lets paper_trader.py exit its poll loop cleanly and persist state.
