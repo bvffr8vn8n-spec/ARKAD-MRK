@@ -45,6 +45,7 @@ Duplicate prevention
     3. One monitor and one trade per asset at a time (dict keyed by asset).
 """
 
+import random
 import time
 from datetime import datetime, timedelta
 from typing import Optional
@@ -98,6 +99,12 @@ def run_poll_loop(
                      shutdown_reason() or "no reason")
             break
 
+        # Random pre-tick jitter de-aligns this loop from the exact HH:MM:SS
+        # second mark where the Bybit IP rate-limit window otherwise gets hit
+        # every hour by the bar-close burst from many simultaneous clients.
+        if config_live.POLL_JITTER_S > 0:
+            time.sleep(random.uniform(0.0, config_live.POLL_JITTER_S))
+
         try:
             _tick(engine, store, feed, csv_writer)
             consecutive_errors = 0   # reset on any successful tick
@@ -148,6 +155,7 @@ def _tick(
 
     # ── Step 1: process new 1H bars ───────────────────────────────────────────
     new_1h_ts = _last_closed_1h_ts(now)
+    fetched_any_1h = False
 
     for asset in config_live.ASSETS:
         stored_ts_str = state["processed_1h_bars"].get(asset, "")
@@ -155,6 +163,13 @@ def _tick(
 
         if new_1h_ts <= stored_ts:
             continue   # no new 1H bar for this asset
+
+        # Stagger sequential kline requests so 4 symbols don't burst into the
+        # same Bybit 5-second IP-rate window (root cause of retCode 10006 at
+        # every HH:00 bar-close).  No delay before the first fetch.
+        if fetched_any_1h and config_live.INTER_ASSET_DELAY_S > 0:
+            time.sleep(config_live.INTER_ASSET_DELAY_S)
+        fetched_any_1h = True
 
         # Fetch the warmup buffer + any bars since last stored
         df_1h = feed.get_1h_bars(asset)
@@ -211,6 +226,7 @@ def _tick(
 
     # ── Step 2: process new 15m bars ──────────────────────────────────────────
     new_15m_ts = _last_closed_15m_ts(now)
+    fetched_any_15m = False
 
     for asset in config_live.ASSETS:
         stored_ts_str = state["processed_15m_bars"].get(asset, "")
@@ -218,6 +234,12 @@ def _tick(
 
         if new_15m_ts <= stored_ts:
             continue   # no new 15m bar
+
+        # Same stagger logic as the 1H loop above — keeps the per-tick burst
+        # under the Bybit IP-rate window.
+        if fetched_any_15m and config_live.INTER_ASSET_DELAY_S > 0:
+            time.sleep(config_live.INTER_ASSET_DELAY_S)
+        fetched_any_15m = True
 
         df_15m = feed.get_15m_bars(asset)
         if df_15m is None or len(df_15m) == 0:

@@ -36,15 +36,26 @@ WARMUP_1H_BARS = 320
 # We only need enough to cover any gap since the last processed bar; one new
 # bar is the normal case, a handful of bars covers brief outages.  Smaller =
 # less bandwidth per request, no impact on the trading logic.
-FETCH_1H_BARS_LIVE  = 5
-FETCH_15M_BARS_LIVE = 10
+FETCH_1H_BARS_LIVE  = 3
+FETCH_15M_BARS_LIVE = 6
 FETCH_15M_BARS      = FETCH_15M_BARS_LIVE   # back-compat alias
 
 # Poll interval in seconds — how often the main loop wakes up.
-# Trading granularity is 15m bars; 60 s gives a comfortable 15x margin.
-# Larger interval also halves the total Bybit request rate vs. the previous
-# 30 s setting (which was tripping account-level rate limits).
-POLL_INTERVAL_S = 60
+# 90s keeps comfortable margin vs. 15m trading granularity (10× margin) and
+# de-aligns ticks from the HH:00 second mark where every running instance
+# converges (the previous 60s value was bursting at every hour boundary).
+POLL_INTERVAL_S = 90
+
+# Pause between symbols within a single poll tick.  Spaces 4 sequential
+# kline requests over ~1.6s instead of firing all of them in the same
+# Bybit 5-second IP-rate window.  Removes the HH:00 burst that was tripping
+# retCode 10006.
+INTER_ASSET_DELAY_S = 0.4
+
+# Random jitter (seconds) added at the start of every tick.  Avoids the
+# situation where the loop drifts onto exactly HH:00:0X seconds and stays
+# there, colliding with the bar-close burst from other IPs / services.
+POLL_JITTER_S = 5.0
 
 # Retrain the signal model every N newly processed 1H bars (0 = never retrain).
 # At startup the model is always trained from the full historical CSV.
