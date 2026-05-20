@@ -91,6 +91,20 @@ FORWARD_RETURN_WINDOW = 24
 # (median 24H forward move ~1.87 ATR; 0.85 captures the directional majority)
 LABEL_ATR_MULT        = 0.85
 
+# ── Training basis (shared between live paper trader and backtest) ──────────
+# Single source of truth for what data the model is allowed to see at fit time.
+#
+# Convention:
+#   train: bars where bar.index <  TRAINING_CUTOFF_DATE
+#   test : bars where bar.index >= TRAINING_CUTOFF_DATE  (live, BT-OOS, parity)
+#
+# Both paper_trading.signal_engine and the parity test honour this constant.
+# To refresh the model, bump the date manually (recommended: every 3-6 months
+# after re-validating walk-forward on the new training window).  Never set it
+# to a future date in production — that would let the live model train on
+# unrealised price action.
+TRAINING_CUTOFF_DATE = "2026-01-01"
+
 # ── Model ────────────────────────────────────────────────────────────────────
 TEST_SIZE          = 0.2           # Fraction of data held out for evaluation
 RANDOM_STATE       = 42

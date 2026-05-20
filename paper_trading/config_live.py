@@ -18,9 +18,11 @@ _ROOT      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR   = os.path.join(_ROOT, "data")
 PT_DIR     = os.path.join(_ROOT, "paper_trading")
 
-STATE_FILE = os.path.join(PT_DIR, "state.json")
-CSV_FILE   = os.path.join(_ROOT, "paper_trades_tier1.csv")
-LOG_FILE   = os.path.join(PT_DIR, "paper_trader.log")
+STATE_FILE       = os.path.join(PT_DIR, "state.json")
+CSV_FILE         = os.path.join(_ROOT, "paper_trades_tier1.csv")
+LOG_FILE         = os.path.join(PT_DIR, "paper_trader.log")
+# Per-bar signal log — populated for every scored 1H bar, used by parity test.
+SIGNAL_LOG_FILE  = os.path.join(PT_DIR, "signal_log.csv")
 
 # ── Bybit API ─────────────────────────────────────────────────────────────────
 BYBIT_CATEGORY = "linear"   # USDT perpetual futures

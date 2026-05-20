@@ -1,0 +1,211 @@
+"""
+experiments/parity_test.py — Compare live paper-trader signals vs offline replay.
+
+Premise
+-------
+With `config.TRAINING_CUTOFF_DATE` shared by paper trader and this script, both
+sides train on identical pre-cutoff data.  If they then score the same 1H bar
+they MUST produce the same (signal, buy_prob, atr_pct).  Any divergence is a
+bug — either in data ingestion, feature generation, or filter ordering.
+
+How it works
+------------
+1. Instantiate a fresh `SignalEngine` and call `train_all()` — uses the exact
+   same code path as paper trader, so models are bit-identical (modulo RF
+   `random_state`, which is fixed in config).
+2. For each Tier 1 asset, iterate the historical CSV bars where
+   `index >= TRAINING_CUTOFF_DATE` in chronological order, feed each one
+   through `push_bar` + `score_bar`, and capture the result.
+3. Save the offline replay to `experiments/parity_replay_signals.csv`.
+4. Load `paper_trading/signal_log.csv` (written by the live paper trader, one
+   row per scored 1H bar) and inner-join on (asset, bar_ts).
+5. Report:
+     - bars present on both sides         (the comparison universe)
+     - signal-direction agreement count   (exact match on the int signal)
+     - probability max-abs-diff           (should be ~1e-9 if pipelines match)
+     - bars present only in live          (paper trader saw bars not in CSV;
+                                            normal if CSV is older than live)
+     - bars present only in replay        (live paper trader missed bars;
+                                            this is a real parity concern)
+
+Usage
+-----
+    python -m experiments.parity_test
+or
+    python experiments/parity_test.py
+
+Exit code is 0 if parity holds, 1 if any mismatch is detected.
+"""
+
+import os
+import sys
+from typing import Optional
+
+# Force UTF-8 console output on Windows (avoids cp1251 codec errors)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
+import pandas as pd
+
+# Ensure project root is on sys.path
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+import config as pipeline_config
+from data.loader import load_ohlcv
+from paper_trading import config_live
+from paper_trading.signal_engine import SignalEngine
+
+REPLAY_OUTPUT = os.path.join(_ROOT, "experiments", "parity_replay_signals.csv")
+LIVE_LOG_PATH = config_live.SIGNAL_LOG_FILE
+
+PROB_TOLERANCE = 1e-6   # float roundtrip headroom across pandas / numpy / pickle
+ATR_TOLERANCE  = 1e-8
+
+
+def run_offline_replay() -> pd.DataFrame:
+    """Train and replay all post-cutoff bars for every Tier 1 asset."""
+    print(f"  Training cutoff:  {pipeline_config.TRAINING_CUTOFF_DATE}")
+    print(f"  Assets:           {', '.join(config_live.ASSETS)}")
+    print(f"  Training models (full pre-cutoff history) ...")
+
+    engine = SignalEngine()
+    engine.train_all()
+
+    cutoff = pd.Timestamp(pipeline_config.TRAINING_CUTOFF_DATE)
+    rows: list[dict] = []
+
+    for asset in config_live.ASSETS:
+        if asset not in engine._models:
+            print(f"  {asset}: model missing (training failed); skipping replay.")
+            continue
+
+        csv_path = os.path.join(config_live.DATA_DIR, f"{asset}_1h_4y.csv")
+        df_raw = load_ohlcv(csv_path)
+        post = df_raw[df_raw.index >= cutoff].sort_index()
+        ohlcv_cols = ["open", "high", "low", "close", "volume"]
+
+        print(f"  {asset}: replaying {len(post)} post-cutoff bars ...", end="", flush=True)
+        for ts, row in post.iterrows():
+            bar = row[ohlcv_cols].copy()
+            bar.name = ts
+            engine.push_bar(asset, bar)
+            result = engine.score_bar(asset)
+            if result is None:
+                continue
+            rows.append({
+                "bar_ts":   ts.isoformat(),
+                "asset":    asset,
+                "signal":   int(result["signal"]),
+                "buy_prob": float(result["buy_prob"]),
+                "sell_prob": float(result["sell_prob"]),
+                "atr_pct":  float(result["atr_pct"]),
+                "close":    float(result["close"]),
+            })
+        print(f" {sum(1 for r in rows if r['asset'] == asset)} scored")
+
+    return pd.DataFrame(rows)
+
+
+def load_live_signal_log() -> Optional[pd.DataFrame]:
+    if not os.path.exists(LIVE_LOG_PATH):
+        return None
+    df = pd.read_csv(LIVE_LOG_PATH)
+    if len(df) == 0:
+        return df
+    df["bar_ts"]    = df["bar_ts"].astype(str)
+    df["signal"]    = df["signal"].astype(int)
+    df["buy_prob"]  = df["buy_prob"].astype(float)
+    df["sell_prob"] = df["sell_prob"].astype(float)
+    df["atr_pct"]   = df["atr_pct"].astype(float)
+    df["close"]     = df["close"].astype(float)
+    return df
+
+
+def compare(replay: pd.DataFrame, live: pd.DataFrame) -> int:
+    """Print parity diff. Returns 0 on full parity, 1 on any mismatch."""
+    sep = "-" * 72
+    print(f"\n  Parity diff")
+    print(f"  {sep}")
+
+    if live is None:
+        print(f"  Live signal log not found: {LIVE_LOG_PATH}")
+        print(f"  Paper trader hasn't run yet (or hasn't scored a bar).")
+        print(f"  Offline replay saved to {REPLAY_OUTPUT} — re-run after live"
+              f" has logged at least one bar to actually compare.")
+        return 0
+
+    if len(live) == 0:
+        print(f"  Live signal log is empty (header only). No comparison possible yet.")
+        return 0
+
+    key = ["asset", "bar_ts"]
+    merged = replay.merge(
+        live, on=key, how="outer", suffixes=("_replay", "_live"),
+        indicator=True,
+    )
+
+    both       = merged[merged["_merge"] == "both"]
+    only_live  = merged[merged["_merge"] == "right_only"]
+    only_replay = merged[merged["_merge"] == "left_only"]
+
+    signal_mismatch = both[both["signal_replay"] != both["signal_live"]]
+    prob_diff       = (both["buy_prob_replay"] - both["buy_prob_live"]).abs()
+    prob_mismatch   = both[prob_diff > PROB_TOLERANCE]
+    atr_diff        = (both["atr_pct_replay"] - both["atr_pct_live"]).abs()
+    atr_mismatch    = both[atr_diff > ATR_TOLERANCE]
+
+    print(f"  Compared bars (both sides):    {len(both):>6}")
+    print(f"    signal mismatches:            {len(signal_mismatch):>6}")
+    print(f"    buy_prob diff > {PROB_TOLERANCE:g}:    {len(prob_mismatch):>6}  "
+          f"(max diff = {prob_diff.max() if len(both) else 0.0:.3e})")
+    print(f"    atr_pct diff > {ATR_TOLERANCE:g}:     {len(atr_mismatch):>6}  "
+          f"(max diff = {atr_diff.max() if len(both) else 0.0:.3e})")
+    print(f"  Only in live (CSV doesn't cover yet): {len(only_live):>6}")
+    print(f"  Only in replay (LIVE MISSED these!):  {len(only_replay):>6}")
+    print(f"  {sep}")
+
+    has_mismatch = (
+        len(signal_mismatch) > 0
+        or len(prob_mismatch) > 0
+        or len(atr_mismatch) > 0
+        or len(only_replay) > 0
+    )
+
+    if signal_mismatch.empty and prob_mismatch.empty and atr_mismatch.empty:
+        print(f"  ✓ Model parity holds on all {len(both)} overlapping bars.")
+    else:
+        print(f"  ✗ PARITY BROKEN — see mismatches above.")
+        if len(signal_mismatch) > 0:
+            print(f"\n  First 5 signal mismatches:")
+            cols = ["asset", "bar_ts", "signal_replay", "signal_live",
+                    "buy_prob_replay", "buy_prob_live"]
+            print(signal_mismatch[cols].head(5).to_string(index=False))
+
+    if len(only_replay) > 0:
+        print(f"\n  Live paper trader missed {len(only_replay)} post-cutoff bars.")
+        print(f"  (Check polling reliability / Bybit fetch failures for these timestamps.)")
+        print(only_replay[["asset", "bar_ts"]].head(10).to_string(index=False))
+
+    return 1 if has_mismatch else 0
+
+
+def main() -> int:
+    print("=" * 72)
+    print("  ARKAD MRK — Live↔Backtest Parity Test")
+    print("=" * 72)
+
+    replay = run_offline_replay()
+    replay.to_csv(REPLAY_OUTPUT, index=False, encoding="utf-8")
+    print(f"\n  Replay saved: {REPLAY_OUTPUT}  ({len(replay)} rows)")
+
+    live = load_live_signal_log()
+    rc = compare(replay, live)
+
+    print()
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

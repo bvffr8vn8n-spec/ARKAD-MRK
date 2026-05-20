@@ -69,6 +69,18 @@ class SignalEngine:
 
     def train_all(self) -> None:
         """Load historical CSVs and train one model per asset."""
+        log.info(
+            "Training basis: bars with date < %s  (config.TRAINING_CUTOFF_DATE). "
+            "Live scoring + parity test use bars at or after this date.",
+            pipeline_config.TRAINING_CUTOFF_DATE,
+        )
+        if config_live.RETRAIN_EVERY_N_BARS > 0:
+            log.warning(
+                "RETRAIN_EVERY_N_BARS=%d is enabled — periodic retrain uses the "
+                "rolling buffer, which contains post-cutoff bars.  This BREAKS "
+                "parity with backtest.  Keep retrain disabled (0) for parity runs.",
+                config_live.RETRAIN_EVERY_N_BARS,
+            )
         for asset in config_live.ASSETS:
             self._train_asset(asset)
 
@@ -190,7 +202,14 @@ class SignalEngine:
     # ── Private ────────────────────────────────────────────────────────────────
 
     def _train_asset(self, asset: str) -> None:
-        """Load 1H CSV for asset and train the model on full history."""
+        """
+        Load 1H CSV for asset and train the model on history STRICTLY BEFORE
+        pipeline_config.TRAINING_CUTOFF_DATE.
+
+        Bars at or after the cutoff are reserved for live scoring (paper trader)
+        and out-of-sample backtest evaluation.  This guarantees that the live
+        model and any cutoff-aware backtest see identical training data.
+        """
         csv_path = os.path.join(config_live.DATA_DIR, f"{asset}_1h_4y.csv")
         if not os.path.exists(csv_path):
             log.error("Historical CSV not found: %s — skipping %s", csv_path, asset)
@@ -199,15 +218,38 @@ class SignalEngine:
         log.info("Training model for %s from %s ...", asset, csv_path)
         try:
             df_raw = load_ohlcv(csv_path)
-            self._train_from_df(asset, df_raw)
 
-            # Seed the rolling buffer with the last WARMUP_1H_BARS bars of raw OHLCV
+            cutoff      = pd.Timestamp(pipeline_config.TRAINING_CUTOFF_DATE)
+            n_total     = len(df_raw)
+            df_train    = df_raw[df_raw.index < cutoff]
+            n_post      = n_total - len(df_train)
+
+            if len(df_train) < 200:
+                log.error(
+                    "  %s: only %d bars before cutoff %s — refusing to train "
+                    "(need ≥200).  Bump TRAINING_CUTOFF_DATE or re-download data.",
+                    asset, len(df_train), cutoff.date(),
+                )
+                return
+
+            self._train_from_df(asset, df_train)
+
+            # Seed the rolling buffer with the last WARMUP_1H_BARS bars BEFORE
+            # the cutoff.  Post-cutoff bars are appended by the poller as they
+            # arrive from the live feed — they must not pre-populate the buffer
+            # or the live state would diverge from a fresh paper-trader start.
             ohlcv_cols = ["open", "high", "low", "close", "volume"]
-            self._buffers[asset] = df_raw[ohlcv_cols].iloc[-config_live.WARMUP_1H_BARS:].copy()
+            self._buffers[asset] = (
+                df_train[ohlcv_cols].iloc[-config_live.WARMUP_1H_BARS:].copy()
+            )
             self._bars_since_retrain[asset] = 0
 
-            log.info("  %s: model trained, buffer seeded (%d bars)",
-                     asset, len(self._buffers[asset]))
+            log.info(
+                "  %s: cutoff=%s  train_bars=%d  reserved_post_cutoff=%d  "
+                "buffer_seeded=%d",
+                asset, cutoff.date(), len(df_train), n_post,
+                len(self._buffers[asset]),
+            )
         except Exception as exc:
             log.error("Training failed for %s: %s", asset, exc, exc_info=True)
 

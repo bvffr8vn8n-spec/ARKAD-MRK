@@ -53,11 +53,13 @@ from typing import Optional
 import pandas as pd
 
 from paper_trading import config_live
+from paper_trading import scheduler
 from paper_trading.csv_writer import CsvWriter
 from paper_trading.data_feed import LiveFeed
 from paper_trading.logger import get_logger
 from paper_trading.runtime import is_shutdown_requested, shutdown_reason
 from paper_trading.signal_engine import SignalEngine
+from paper_trading.signal_log import SignalLog
 from paper_trading.state_machine import MonitorState, advance_monitor
 from paper_trading.state_store import StateStore
 from paper_trading.trade_manager import TradeManager, TradeState
@@ -78,6 +80,7 @@ def run_poll_loop(
     store: StateStore,
     feed: LiveFeed,
     csv_writer: CsvWriter,
+    signal_log: SignalLog,
 ) -> None:
     """
     Blocking main loop.  Runs until interrupted (KeyboardInterrupt / SIGINT).
@@ -86,8 +89,12 @@ def run_poll_loop(
     loop unit-testable without a live network connection.
     """
     log.info("Poll loop started.  Monitoring: %s", ", ".join(config_live.ASSETS))
-    log.info("Poll interval: %ds | 1H warmup bars: %d | assets: %d",
-             config_live.POLL_INTERVAL_S, config_live.WARMUP_1H_BARS, len(config_live.ASSETS))
+    log.info(
+        "Scheduler: bar-close wake-up (15m grid + %.0f-%.0fs grace + 0-%.0fs jitter); "
+        "1H warmup bars: %d | assets: %d",
+        scheduler.GRACE_MIN_S, scheduler.GRACE_MAX_S, scheduler.JITTER_MAX_S,
+        config_live.WARMUP_1H_BARS, len(config_live.ASSETS),
+    )
 
     consecutive_errors = 0
 
@@ -106,7 +113,7 @@ def run_poll_loop(
             time.sleep(random.uniform(0.0, config_live.POLL_JITTER_S))
 
         try:
-            _tick(engine, store, feed, csv_writer)
+            _tick(engine, store, feed, csv_writer, signal_log)
             consecutive_errors = 0   # reset on any successful tick
         except KeyboardInterrupt:
             log.info("Keyboard interrupt received — shutting down.")
@@ -125,7 +132,15 @@ def run_poll_loop(
                 time.sleep(_TICK_ERROR_COOLDOWN_S)
                 continue
 
-        time.sleep(config_live.POLL_INTERVAL_S)
+        # Sleep until just after the next 15m bar boundary (grace + jitter
+        # baked into the scheduler).  Replaces the old fixed POLL_INTERVAL_S
+        # cadence: ~4 wake-ups/hour instead of ~40, hourly burst removed by
+        # construction.  POLL_JITTER_S above is now redundant safety belt.
+        now      = datetime.utcnow()
+        sleep_s  = scheduler.seconds_until_next_bar_wake(now)
+        log.debug("Next wake in %.1fs (target boundary %s)",
+                  sleep_s, scheduler.next_wake_label(now))
+        time.sleep(sleep_s)
 
 
 # ── Private ────────────────────────────────────────────────────────────────────
@@ -135,6 +150,7 @@ def _tick(
     store: StateStore,
     feed: LiveFeed,
     csv_writer: CsvWriter,
+    signal_log: SignalLog,
 ) -> None:
     """One iteration of the polling loop."""
     now    = datetime.utcnow()
@@ -191,30 +207,46 @@ def _tick(
             # Push to signal engine buffer
             engine.push_bar(asset, bar)
 
-            # Score the bar (only if no open trade and no active monitor)
-            has_open_trade   = asset in trade_mgr.open_trades
+            # Score the bar UNCONDITIONALLY — needed for live↔backtest parity
+            # diagnostics.  The actual monitor-start decision is still gated on
+            # no open trade + no active monitor; we just don't want the live
+            # trade state to hide what the model would have emitted on this bar.
+            has_open_trade     = asset in trade_mgr.open_trades
             has_active_monitor = asset in monitors and monitors[asset].phase not in ("ENTERED", "CANCELLED")
 
-            if not has_open_trade and not has_active_monitor:
-                result = engine.score_bar(asset)
-                if result is not None and result["signal"] != 0:
-                    # Start A+B monitor for this signal
-                    atr_dollars = result["atr_pct"] * result["close"]
-                    monitor = MonitorState(
-                        asset        = asset,
-                        signal       = result["signal"],
-                        signal_ts    = ts.isoformat(),
-                        signal_close = result["close"],
-                        atr_1h       = atr_dollars,
-                    )
-                    monitors[asset] = monitor
-                    log.info(
-                        "%s  1H signal=%+d  prob=%.3f  close=%.6f  atr=%.6f  → A_WATCHING",
-                        asset, result["signal"],
-                        result["buy_prob"] if result["signal"] == 1 else result["sell_prob"],
-                        result["close"], atr_dollars,
-                    )
-                    dirty = True
+            result = engine.score_bar(asset)
+            if result is not None:
+                signal_log.append(
+                    bar_ts             = ts.isoformat(),
+                    asset              = asset,
+                    signal             = result["signal"],
+                    buy_prob           = result["buy_prob"],
+                    sell_prob          = result["sell_prob"],
+                    atr_pct            = result["atr_pct"],
+                    close              = result["close"],
+                    had_open_trade     = has_open_trade,
+                    had_active_monitor = has_active_monitor,
+                )
+
+            if (not has_open_trade and not has_active_monitor
+                    and result is not None and result["signal"] != 0):
+                # Start A+B monitor for this signal
+                atr_dollars = result["atr_pct"] * result["close"]
+                monitor = MonitorState(
+                    asset        = asset,
+                    signal       = result["signal"],
+                    signal_ts    = ts.isoformat(),
+                    signal_close = result["close"],
+                    atr_1h       = atr_dollars,
+                )
+                monitors[asset] = monitor
+                log.info(
+                    "%s  1H signal=%+d  prob=%.3f  close=%.6f  atr=%.6f  → A_WATCHING",
+                    asset, result["signal"],
+                    result["buy_prob"] if result["signal"] == 1 else result["sell_prob"],
+                    result["close"], atr_dollars,
+                )
+                dirty = True
 
             # Retrain if scheduled
             if engine.should_retrain(asset):

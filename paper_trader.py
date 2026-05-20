@@ -53,6 +53,7 @@ from paper_trading.config_live import ASSETS, INITIAL_CAPITAL, STATE_FILE, CSV_F
 from paper_trading.data_feed import LiveFeed
 from paper_trading.runtime import request_shutdown
 from paper_trading.signal_engine import SignalEngine
+from paper_trading.signal_log import SignalLog
 from paper_trading.state_store import StateStore
 from paper_trading.csv_writer import CsvWriter
 from paper_trading.poller import run_poll_loop
@@ -203,6 +204,7 @@ def main() -> None:
     engine     = SignalEngine()
     feed       = LiveFeed()
     csv_writer = CsvWriter()
+    signal_log = SignalLog()
 
     # Train models (this takes ~15–30 seconds per asset)
     log.info("Training signal models ...")
@@ -214,7 +216,7 @@ def main() -> None:
     #   - KeyboardInterrupt at top level
     #   - Uncaught exception (will propagate out, logged by the except below)
     try:
-        run_poll_loop(engine, store, feed, csv_writer)
+        run_poll_loop(engine, store, feed, csv_writer, signal_log)
     except Exception:
         log.exception("Poll loop terminated by unhandled exception.")
         raise
