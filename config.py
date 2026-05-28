@@ -95,14 +95,20 @@ LABEL_ATR_MULT        = 0.85
 # Single source of truth for what data the model is allowed to see at fit time.
 #
 # Convention:
-#   train: bars where bar.index <  TRAINING_CUTOFF_DATE
-#   test : bars where bar.index >= TRAINING_CUTOFF_DATE  (live, BT-OOS, parity)
+#   train: bars where TRAINING_START_DATE <= bar.index < TRAINING_CUTOFF_DATE
+#   test : bars where bar.index >= TRAINING_CUTOFF_DATE   (live, BT-OOS, parity)
 #
-# Both paper_trading.signal_engine and the parity test honour this constant.
-# To refresh the model, bump the date manually (recommended: every 3-6 months
-# after re-validating walk-forward on the new training window).  Never set it
-# to a future date in production — that would let the live model train on
-# unrealised price action.
+# Both ends are fixed because data/download_all.py uses YEARS_BACK from the
+# CURRENT date — a `--force` redownload silently shifts the CSV start forward,
+# which used to invalidate any model trained from the older CSV.  Anchoring
+# both START and CUTOFF makes the training set CSV-refresh-proof: if the CSV
+# happens to start earlier than TRAINING_START_DATE the extra bars are dropped;
+# if it starts later, a warning is logged so the operator can re-download.
+#
+# When bumping CUTOFF (recommended every 3-6 months), review START too —
+# keeping a 3-year span (e.g., START=2023-01-01 ↔ CUTOFF=2026-01-01) preserves
+# walk-forward comparability across model refreshes.
+TRAINING_START_DATE  = "2022-06-01"
 TRAINING_CUTOFF_DATE = "2026-01-01"
 
 # ── Model ────────────────────────────────────────────────────────────────────

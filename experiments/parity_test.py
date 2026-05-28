@@ -124,7 +124,16 @@ def load_live_signal_log() -> Optional[pd.DataFrame]:
 
 
 def compare(replay: pd.DataFrame, live: pd.DataFrame) -> int:
-    """Print parity diff. Returns 0 on full parity, 1 on any mismatch."""
+    """
+    Print parity diff. Returns 0 on full parity, 1 on any mismatch.
+
+    Diagnostics distinguish three classes of "only in replay" bars:
+      - bars before live ever started   → expected, paper trader wasn't running
+      - bars after CSV ends             → impossible by construction (filtered out)
+      - bars inside the live window     → ACTUAL parity concern (live missed them)
+
+    Only the third class fails parity.
+    """
     sep = "-" * 72
     print(f"\n  Parity diff")
     print(f"  {sep}")
@@ -146,9 +155,15 @@ def compare(replay: pd.DataFrame, live: pd.DataFrame) -> int:
         indicator=True,
     )
 
-    both       = merged[merged["_merge"] == "both"]
-    only_live  = merged[merged["_merge"] == "right_only"]
+    both        = merged[merged["_merge"] == "both"]
+    only_live   = merged[merged["_merge"] == "right_only"]
     only_replay = merged[merged["_merge"] == "left_only"]
+
+    live_start = live["bar_ts"].min()
+    csv_end    = replay["bar_ts"].max() if len(replay) > 0 else None
+
+    only_replay_before_live = only_replay[only_replay["bar_ts"] < live_start]
+    only_replay_after_live  = only_replay[only_replay["bar_ts"] >= live_start]
 
     signal_mismatch = both[both["signal_replay"] != both["signal_live"]]
     prob_diff       = (both["buy_prob_replay"] - both["buy_prob_live"]).abs()
@@ -156,24 +171,37 @@ def compare(replay: pd.DataFrame, live: pd.DataFrame) -> int:
     atr_diff        = (both["atr_pct_replay"] - both["atr_pct_live"]).abs()
     atr_mismatch    = both[atr_diff > ATR_TOLERANCE]
 
-    print(f"  Compared bars (both sides):    {len(both):>6}")
-    print(f"    signal mismatches:            {len(signal_mismatch):>6}")
-    print(f"    buy_prob diff > {PROB_TOLERANCE:g}:    {len(prob_mismatch):>6}  "
-          f"(max diff = {prob_diff.max() if len(both) else 0.0:.3e})")
-    print(f"    atr_pct diff > {ATR_TOLERANCE:g}:     {len(atr_mismatch):>6}  "
-          f"(max diff = {atr_diff.max() if len(both) else 0.0:.3e})")
-    print(f"  Only in live (CSV doesn't cover yet): {len(only_live):>6}")
-    print(f"  Only in replay (LIVE MISSED these!):  {len(only_replay):>6}")
+    print(f"  Live log starts:                       {live_start}")
+    print(f"  CSV replay ends:                       {csv_end}")
+    print(f"  Compared bars (both sides):         {len(both):>6}")
+    if len(both) > 0:
+        print(f"    signal mismatches:                {len(signal_mismatch):>6}")
+        print(f"    buy_prob diff > {PROB_TOLERANCE:g}:        {len(prob_mismatch):>6}  "
+              f"(max diff = {prob_diff.max():.3e})")
+        print(f"    atr_pct diff > {ATR_TOLERANCE:g}:         {len(atr_mismatch):>6}  "
+              f"(max diff = {atr_diff.max():.3e})")
+    print(f"  Only in live  (after CSV's last bar): {len(only_live):>6}  "
+          f"— expected if CSV is stale; refresh data to extend overlap")
+    print(f"  Only in replay (before live started): "
+          f"{len(only_replay_before_live):>6}  — expected, paper trader started "
+          f"on {live_start[:10]}")
+    print(f"  Only in replay (LIVE actually MISSED): "
+          f"{len(only_replay_after_live):>6}  — real parity concern")
     print(f"  {sep}")
 
-    has_mismatch = (
-        len(signal_mismatch) > 0
-        or len(prob_mismatch) > 0
-        or len(atr_mismatch) > 0
-        or len(only_replay) > 0
+    parity_ok = (
+        len(signal_mismatch) == 0
+        and len(prob_mismatch) == 0
+        and len(atr_mismatch) == 0
+        and len(only_replay_after_live) == 0
     )
 
-    if signal_mismatch.empty and prob_mismatch.empty and atr_mismatch.empty:
+    if len(both) == 0:
+        print(f"  ⚠ No overlap between live log and replay.")
+        print(f"    Live started after CSV last bar, OR CSV ends before live "
+              f"start.  Refresh CSV (download_all.py --force) so the comparison "
+              f"window actually exists, then re-run.")
+    elif parity_ok:
         print(f"  ✓ Model parity holds on all {len(both)} overlapping bars.")
     else:
         print(f"  ✗ PARITY BROKEN — see mismatches above.")
@@ -183,12 +211,12 @@ def compare(replay: pd.DataFrame, live: pd.DataFrame) -> int:
                     "buy_prob_replay", "buy_prob_live"]
             print(signal_mismatch[cols].head(5).to_string(index=False))
 
-    if len(only_replay) > 0:
-        print(f"\n  Live paper trader missed {len(only_replay)} post-cutoff bars.")
-        print(f"  (Check polling reliability / Bybit fetch failures for these timestamps.)")
-        print(only_replay[["asset", "bar_ts"]].head(10).to_string(index=False))
+    if len(only_replay_after_live) > 0:
+        print(f"\n  Live missed {len(only_replay_after_live)} bars inside its "
+              f"running window.  Check polling reliability / Bybit fetch failures:")
+        print(only_replay_after_live[["asset", "bar_ts"]].head(10).to_string(index=False))
 
-    return 1 if has_mismatch else 0
+    return 0 if parity_ok else 1
 
 
 def main() -> int:

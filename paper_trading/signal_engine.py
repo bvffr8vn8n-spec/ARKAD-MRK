@@ -70,8 +70,10 @@ class SignalEngine:
     def train_all(self) -> None:
         """Load historical CSVs and train one model per asset."""
         log.info(
-            "Training basis: bars with date < %s  (config.TRAINING_CUTOFF_DATE). "
-            "Live scoring + parity test use bars at or after this date.",
+            "Training basis: bars in [%s, %s)  (config.TRAINING_START_DATE / "
+            "TRAINING_CUTOFF_DATE).  Live scoring + parity test use bars at or "
+            "after the cutoff.",
+            pipeline_config.TRAINING_START_DATE,
             pipeline_config.TRAINING_CUTOFF_DATE,
         )
         if config_live.RETRAIN_EVERY_N_BARS > 0:
@@ -203,12 +205,13 @@ class SignalEngine:
 
     def _train_asset(self, asset: str) -> None:
         """
-        Load 1H CSV for asset and train the model on history STRICTLY BEFORE
-        pipeline_config.TRAINING_CUTOFF_DATE.
+        Load 1H CSV for asset and train the model on history bounded by
+        [TRAINING_START_DATE, TRAINING_CUTOFF_DATE).
 
-        Bars at or after the cutoff are reserved for live scoring (paper trader)
-        and out-of-sample backtest evaluation.  This guarantees that the live
-        model and any cutoff-aware backtest see identical training data.
+        Both ends are anchored so CSV refreshes (which shift the data's actual
+        start forward, because download_all.py uses YEARS_BACK from today) do
+        not silently change the training set.  Bars at or after the cutoff are
+        reserved for live scoring and out-of-sample backtest evaluation.
         """
         csv_path = os.path.join(config_live.DATA_DIR, f"{asset}_1h_4y.csv")
         if not os.path.exists(csv_path):
@@ -218,17 +221,34 @@ class SignalEngine:
         log.info("Training model for %s from %s ...", asset, csv_path)
         try:
             df_raw = load_ohlcv(csv_path)
+            if len(df_raw) == 0:
+                log.error("  %s: CSV is empty — skipping", asset)
+                return
 
-            cutoff      = pd.Timestamp(pipeline_config.TRAINING_CUTOFF_DATE)
-            n_total     = len(df_raw)
-            df_train    = df_raw[df_raw.index < cutoff]
-            n_post      = n_total - len(df_train)
+            start   = pd.Timestamp(pipeline_config.TRAINING_START_DATE)
+            cutoff  = pd.Timestamp(pipeline_config.TRAINING_CUTOFF_DATE)
+            n_total = len(df_raw)
+            df_train = df_raw[(df_raw.index >= start) & (df_raw.index < cutoff)]
+            n_post   = (df_raw.index >= cutoff).sum()
+
+            csv_start = df_raw.index[0]
+            if csv_start > start:
+                missing_bars = int(((df_raw.index[0] - start) / pd.Timedelta(hours=1)))
+                log.warning(
+                    "  %s: CSV starts at %s but TRAINING_START_DATE is %s — "
+                    "~%d bars are missing from the front of the training window. "
+                    "Re-download data with an earlier start, or bump "
+                    "TRAINING_START_DATE.  Training will proceed on the available "
+                    "range (parity with backtest still holds, but the model differs "
+                    "from one trained on the original window).",
+                    asset, csv_start.date(), start.date(), missing_bars,
+                )
 
             if len(df_train) < 200:
                 log.error(
-                    "  %s: only %d bars before cutoff %s — refusing to train "
-                    "(need ≥200).  Bump TRAINING_CUTOFF_DATE or re-download data.",
-                    asset, len(df_train), cutoff.date(),
+                    "  %s: only %d bars in [%s, %s) — refusing to train "
+                    "(need ≥200).  Re-download earlier history or adjust bounds.",
+                    asset, len(df_train), start.date(), cutoff.date(),
                 )
                 return
 
@@ -245,10 +265,10 @@ class SignalEngine:
             self._bars_since_retrain[asset] = 0
 
             log.info(
-                "  %s: cutoff=%s  train_bars=%d  reserved_post_cutoff=%d  "
+                "  %s: window=[%s, %s)  train_bars=%d  reserved_post_cutoff=%d  "
                 "buffer_seeded=%d",
-                asset, cutoff.date(), len(df_train), n_post,
-                len(self._buffers[asset]),
+                asset, start.date(), cutoff.date(),
+                len(df_train), int(n_post), len(self._buffers[asset]),
             )
         except Exception as exc:
             log.error("Training failed for %s: %s", asset, exc, exc_info=True)
