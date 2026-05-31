@@ -254,21 +254,28 @@ class SignalEngine:
 
             self._train_from_df(asset, df_train)
 
-            # Seed the rolling buffer with the last WARMUP_1H_BARS bars BEFORE
-            # the cutoff.  Post-cutoff bars are appended by the poller as they
-            # arrive from the live feed — they must not pre-populate the buffer
-            # or the live state would diverge from a fresh paper-trader start.
+            # Seed the rolling buffer with the last WARMUP_1H_BARS bars of the
+            # FULL CSV (including post-cutoff bars when present).  The model
+            # was fit only on pre-cutoff data above, but the buffer must be
+            # contiguous up to "now" so that indicators (SMA200, ATR14, etc.)
+            # compute on real recent context.  Seeding from df_train would
+            # leave a gap between the cutoff and the first live bar; in that
+            # window SMA200 averages months-old prices against today's price,
+            # producing extreme features and false strong signals for ~320
+            # bars (13 days) after every restart.
             ohlcv_cols = ["open", "high", "low", "close", "volume"]
             self._buffers[asset] = (
-                df_train[ohlcv_cols].iloc[-config_live.WARMUP_1H_BARS:].copy()
+                df_raw[ohlcv_cols].iloc[-config_live.WARMUP_1H_BARS:].copy()
             )
             self._bars_since_retrain[asset] = 0
 
+            buf = self._buffers[asset]
             log.info(
                 "  %s: window=[%s, %s)  train_bars=%d  reserved_post_cutoff=%d  "
-                "buffer_seeded=%d",
+                "buffer=[%s, %s]  n=%d",
                 asset, start.date(), cutoff.date(),
-                len(df_train), int(n_post), len(self._buffers[asset]),
+                len(df_train), int(n_post),
+                buf.index[0], buf.index[-1], len(buf),
             )
         except Exception as exc:
             log.error("Training failed for %s: %s", asset, exc, exc_info=True)
