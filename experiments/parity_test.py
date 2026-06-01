@@ -60,8 +60,9 @@ from paper_trading.signal_engine import SignalEngine
 REPLAY_OUTPUT = os.path.join(_ROOT, "experiments", "parity_replay_signals.csv")
 LIVE_LOG_PATH = config_live.SIGNAL_LOG_FILE
 
-PROB_TOLERANCE = 1e-6   # float roundtrip headroom across pandas / numpy / pickle
-ATR_TOLERANCE  = 1e-8
+PROB_TOLERANCE  = 1e-6   # float roundtrip headroom across pandas / numpy / pickle
+ATR_TOLERANCE   = 1e-8
+OHLC_TOLERANCE  = 1e-6   # raw OHLC: tighter than prob (no model layer in between)
 
 
 def run_offline_replay() -> pd.DataFrame:
@@ -101,7 +102,11 @@ def run_offline_replay() -> pd.DataFrame:
                 "buy_prob": float(result["buy_prob"]),
                 "sell_prob": float(result["sell_prob"]),
                 "atr_pct":  float(result["atr_pct"]),
+                "open":     float(row["open"]),
+                "high":     float(row["high"]),
+                "low":      float(row["low"]),
                 "close":    float(result["close"]),
+                "volume":   float(row.get("volume", 0.0)),
             })
         print(f" {sum(1 for r in rows if r['asset'] == asset)} scored")
 
@@ -120,6 +125,11 @@ def load_live_signal_log() -> Optional[pd.DataFrame]:
     df["sell_prob"] = df["sell_prob"].astype(float)
     df["atr_pct"]   = df["atr_pct"].astype(float)
     df["close"]     = df["close"].astype(float)
+    # OHLCV columns are present only after the 2026-06-01 schema bump.
+    # If absent (older log file), leave as NaN — comparison code tolerates that.
+    for col in ("open", "high", "low", "volume"):
+        if col in df.columns:
+            df[col] = df[col].astype(float)
     return df
 
 
@@ -171,6 +181,20 @@ def compare(replay: pd.DataFrame, live: pd.DataFrame) -> int:
     atr_diff        = (both["atr_pct_replay"] - both["atr_pct_live"]).abs()
     atr_mismatch    = both[atr_diff > ATR_TOLERANCE]
 
+    # Raw OHLC diffs — present only if both sides logged the new schema.
+    ohlc_stats: dict[str, tuple[int, float]] = {}   # col → (count_over_tol, max_diff)
+    has_ohlc_live = "open_live" in both.columns
+    if has_ohlc_live:
+        for col in ("open", "high", "low", "close", "volume"):
+            r_col = f"{col}_replay"
+            l_col = f"{col}_live"
+            if r_col in both.columns and l_col in both.columns:
+                d = (both[r_col] - both[l_col]).abs()
+                tol = OHLC_TOLERANCE * (both[r_col].abs().clip(lower=1.0))
+                n_over = int((d > tol).sum())
+                max_d  = float(d.max()) if len(d) else 0.0
+                ohlc_stats[col] = (n_over, max_d)
+
     print(f"  Live log starts:                       {live_start}")
     print(f"  CSV replay ends:                       {csv_end}")
     print(f"  Compared bars (both sides):         {len(both):>6}")
@@ -180,6 +204,14 @@ def compare(replay: pd.DataFrame, live: pd.DataFrame) -> int:
               f"(max diff = {prob_diff.max():.3e})")
         print(f"    atr_pct diff > {ATR_TOLERANCE:g}:         {len(atr_mismatch):>6}  "
               f"(max diff = {atr_diff.max():.3e})")
+        if ohlc_stats:
+            print(f"    raw OHLC (rel-tol {OHLC_TOLERANCE:g}):")
+            for col, (n_over, max_d) in ohlc_stats.items():
+                print(f"      {col:<7}  bars over tol: {n_over:>4}  "
+                      f"max abs diff = {max_d:.3e}")
+        elif has_ohlc_live is False:
+            print(f"    raw OHLC: live log predates the OHLC schema; "
+                  f"restart paper trader to start logging open/high/low/volume.")
     print(f"  Only in live  (after CSV's last bar): {len(only_live):>6}  "
           f"— expected if CSV is stale; refresh data to extend overlap")
     print(f"  Only in replay (before live started): "

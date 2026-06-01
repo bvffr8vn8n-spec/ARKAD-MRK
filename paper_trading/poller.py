@@ -223,7 +223,11 @@ def _tick(
                     buy_prob           = result["buy_prob"],
                     sell_prob          = result["sell_prob"],
                     atr_pct            = result["atr_pct"],
+                    open_              = float(bar["open"]),
+                    high               = float(bar["high"]),
+                    low                = float(bar["low"]),
                     close              = result["close"],
+                    volume             = float(bar.get("volume", 0.0)),
                     had_open_trade     = has_open_trade,
                     had_active_monitor = has_active_monitor,
                 )
