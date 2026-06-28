@@ -87,6 +87,17 @@ def run_offline_replay() -> pd.DataFrame:
         post = df_raw[df_raw.index >= cutoff].sort_index()
         ohlcv_cols = ["open", "high", "low", "close", "volume"]
 
+        # Reset the buffer to PRE-cutoff bars only.  signal_engine._train_asset
+        # seeds the buffer from the full CSV (including post-cutoff bars) for
+        # correct live operation — but for replay that causes push_bar to dedup-
+        # skip every post-cutoff bar, freezing the buffer at csv_last and
+        # producing the same score for every iteration.  Re-seeding here lets
+        # replay roll the buffer forward bar-by-bar as if from a cold start.
+        df_pre = df_raw[df_raw.index < cutoff]
+        engine._buffers[asset] = (
+            df_pre[ohlcv_cols].iloc[-config_live.WARMUP_1H_BARS:].copy()
+        )
+
         print(f"  {asset}: replaying {len(post)} post-cutoff bars ...", end="", flush=True)
         for ts, row in post.iterrows():
             bar = row[ohlcv_cols].copy()

@@ -215,7 +215,13 @@ def _tick(
             has_active_monitor = asset in monitors and monitors[asset].phase not in ("ENTERED", "CANCELLED")
 
             result = engine.score_bar(asset)
-            if result is not None:
+            # Only log when the buffer actually advanced to this bar.  If
+            # push_bar was a no-op (this ts was already in the buffer because
+            # the CSV seed includes post-cutoff bars and Bybit returned an
+            # overlapping bar), score_bar reflects buffer state ending at a
+            # LATER ts than `ts` — logging it would mis-label the row.
+            buf_tail_ts = engine._buffers[asset].index[-1] if asset in engine._buffers else None
+            if result is not None and buf_tail_ts == ts:
                 signal_log.append(
                     bar_ts             = ts.isoformat(),
                     asset              = asset,
@@ -233,8 +239,11 @@ def _tick(
                 )
 
             if (not has_open_trade and not has_active_monitor
-                    and result is not None and result["signal"] != 0):
-                # Start A+B monitor for this signal
+                    and result is not None and result["signal"] != 0
+                    and buf_tail_ts == ts):
+                # Start A+B monitor for this signal.  The buf_tail_ts == ts
+                # check prevents starting a monitor from a stale-buffer score
+                # (push_bar dedup-skipped because the bar was already in seed).
                 atr_dollars = result["atr_pct"] * result["close"]
                 monitor = MonitorState(
                     asset        = asset,
