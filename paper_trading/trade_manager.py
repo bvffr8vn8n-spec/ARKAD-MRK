@@ -85,6 +85,18 @@ class TradeState:
     _mfe_price: float = 0.0
     _mae_price: float = 0.0
 
+    # MFE / MAE snapshots at fixed checkpoints after entry, recorded once each
+    # at the first 15m bar where elapsed >= 6 / 12 / 18 hours.  Used by the
+    # early-kill BT sweep (experiments/) to bracket when an under-performing
+    # setup could be cut.  None until the checkpoint is crossed; some may
+    # stay None if the trade closed earlier.
+    mfe_r_h6:  Optional[float] = None
+    mae_r_h6:  Optional[float] = None
+    mfe_r_h12: Optional[float] = None
+    mae_r_h12: Optional[float] = None
+    mfe_r_h18: Optional[float] = None
+    mae_r_h18: Optional[float] = None
+
     # Status
     status: str = "OPEN"    # "OPEN" | "CLOSED"
     notes:  str = ""
@@ -216,6 +228,37 @@ class TradeManager:
         )
         return trade
 
+    # ── Checkpoint snapshots ──────────────────────────────────────────────────
+
+    def _maybe_snapshot_checkpoint(
+        self,
+        trade: TradeState,
+        bar_ts: pd.Timestamp,
+    ) -> None:
+        """
+        If a 6h / 12h / 18h post-entry boundary has been crossed for the first
+        time, snapshot the current MFE / MAE into the trade record (in R-units).
+
+        Must be called AFTER trade._mfe_price / _mae_price have been updated
+        for the current bar but BEFORE any exit fires.
+        """
+        r_unit = trade.atr_1h * config_live.STOP_LOSS_ATR_MULT
+        if r_unit <= 0:
+            return
+
+        entry_dt  = datetime.fromisoformat(trade.entry_ts)
+        elapsed_h = (bar_ts.to_pydatetime() - entry_dt).total_seconds() / 3600
+
+        if elapsed_h >= 6 and trade.mfe_r_h6 is None:
+            trade.mfe_r_h6 = trade._mfe_price / r_unit
+            trade.mae_r_h6 = trade._mae_price / r_unit
+        if elapsed_h >= 12 and trade.mfe_r_h12 is None:
+            trade.mfe_r_h12 = trade._mfe_price / r_unit
+            trade.mae_r_h12 = trade._mae_price / r_unit
+        if elapsed_h >= 18 and trade.mfe_r_h18 is None:
+            trade.mfe_r_h18 = trade._mfe_price / r_unit
+            trade.mae_r_h18 = trade._mae_price / r_unit
+
     # ── Update ────────────────────────────────────────────────────────────────
 
     def update_bar(
@@ -274,6 +317,11 @@ class TradeManager:
 
         trade._mfe_price = max(trade._mfe_price, favourable)
         trade._mae_price = max(trade._mae_price, adverse)
+
+        # Snapshot 6h / 12h / 18h MFE/MAE if a checkpoint was just crossed.
+        # Must happen before any exit so the snapshot reflects the bar that
+        # ACTUALLY triggered the checkpoint, not the next bar.
+        self._maybe_snapshot_checkpoint(trade, bar_ts)
 
         slip = config_live.SLIPPAGE_PCT
         exit_price  = None
@@ -386,6 +434,10 @@ class TradeManager:
 
         trade._mfe_price = max(trade._mfe_price, favourable)
         trade._mae_price = max(trade._mae_price, adverse)
+
+        # Snapshot 6h / 12h / 18h MFE/MAE if a checkpoint was just crossed.
+        # Same as in original mode — runs before any exit branch fires.
+        self._maybe_snapshot_checkpoint(trade, bar_ts)
 
         # ── Remember which TPs were already hit BEFORE this bar ───────────────
         tp1_was_hit = trade.tp1_hit   # prevents same-bar BE check after TP1 fires

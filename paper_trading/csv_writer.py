@@ -50,6 +50,13 @@ _COLUMNS = [
     "r_multiple",
     "mfe_r",
     "mae_r",
+    # ── MFE/MAE checkpoints (added 2026-06-XX for early-kill BT sweep) ─────────
+    "mfe_r_h6",
+    "mae_r_h6",
+    "mfe_r_h12",
+    "mae_r_h12",
+    "mfe_r_h18",
+    "mae_r_h18",
     "notes",
     # ── Scaled exit columns ───────────────────────────────────────────────────
     "exit_mode",
@@ -99,6 +106,12 @@ class CsvWriter:
             "r_multiple":       _fmt(trade.r_multiple),
             "mfe_r":            _fmt(trade.mfe_r),
             "mae_r":            _fmt(trade.mae_r),
+            "mfe_r_h6":         _fmt(getattr(trade, "mfe_r_h6", None)),
+            "mae_r_h6":         _fmt(getattr(trade, "mae_r_h6", None)),
+            "mfe_r_h12":        _fmt(getattr(trade, "mfe_r_h12", None)),
+            "mae_r_h12":        _fmt(getattr(trade, "mae_r_h12", None)),
+            "mfe_r_h18":        _fmt(getattr(trade, "mfe_r_h18", None)),
+            "mae_r_h18":        _fmt(getattr(trade, "mae_r_h18", None)),
             "notes":            trade.notes,
             # Scaled exit columns
             "exit_mode":           trade.exit_mode if is_scaled else "original",
@@ -132,9 +145,40 @@ class CsvWriter:
     # ── Private ───────────────────────────────────────────────────────────────
 
     def _ensure_header(self) -> None:
-        """Create the CSV with header row if it does not exist yet."""
+        """
+        Create the CSV with header row if it does not exist.  If a file is
+        present but its header does not match the current schema, rename it
+        to .old[.N] and start fresh — appending new columns to an old file
+        with csv.DictWriter would raise on extras_keys and burn rows.
+        """
         if os.path.exists(self._path):
-            return
+            try:
+                with open(self._path, "r", newline="", encoding="utf-8") as fh:
+                    existing_header = next(csv.reader(fh), None)
+            except Exception as exc:
+                log.error("Could not read CSV log header: %s", exc)
+                return
+
+            if existing_header == _COLUMNS:
+                return   # schema matches, will be appended to
+
+            archive = self._path + ".old"
+            i = 1
+            while os.path.exists(archive):
+                archive = self._path + f".old.{i}"
+                i += 1
+            try:
+                os.rename(self._path, archive)
+                log.info(
+                    "Trade CSV schema changed (cols=%d → %d).  Old file "
+                    "archived as %s; starting fresh.",
+                    len(existing_header) if existing_header else 0,
+                    len(_COLUMNS), archive,
+                )
+            except Exception as exc:
+                log.error("Could not archive old trade CSV: %s", exc)
+                return
+
         try:
             with open(self._path, "w", newline="", encoding="utf-8") as fh:
                 writer = csv.DictWriter(fh, fieldnames=_COLUMNS)
