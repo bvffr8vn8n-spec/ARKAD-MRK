@@ -48,7 +48,11 @@ import pandas as pd
 import config
 
 
-def run_backtest(signals_df: pd.DataFrame, exit_mode: str | None = None):
+def run_backtest(
+    signals_df: pd.DataFrame,
+    exit_mode: str | None = None,
+    early_kill: dict | None = None,
+):
     """
     Parameters
     ----------
@@ -57,6 +61,15 @@ def run_backtest(signals_df: pd.DataFrame, exit_mode: str | None = None):
                  and optionally atr_pct (used to set stop/TP levels).
     exit_mode  : "single" | "scaled" | None
                  None → use config.BACKTEST_EXIT_MODE (defaults to "single").
+    early_kill : optional dict for experimental early-kill rule (scaled mode
+                 only).  Format: {"at_h": int, "mfe_thr": float}.  When
+                 elapsed bars since entry == at_h AND running MFE in R-units
+                 < mfe_thr AND TP1 has NOT yet fired, the trade is force-
+                 closed at bar close with exit_reason = "early_kill".
+                 None (default) preserves legacy behaviour.
+
+                 Used by experiments/early_kill_sweep.py to bracket the
+                 P&L impact of an MFE-based time cut.
 
     Returns
     -------
@@ -67,6 +80,14 @@ def run_backtest(signals_df: pd.DataFrame, exit_mode: str | None = None):
         exit_mode = getattr(config, "BACKTEST_EXIT_MODE", "single")
     if exit_mode not in ("single", "scaled"):
         raise ValueError(f"exit_mode must be 'single' or 'scaled', got {exit_mode!r}")
+
+    ek_at_h    = None
+    ek_mfe_thr = None
+    if early_kill is not None:
+        if exit_mode != "scaled":
+            raise ValueError("early_kill is only supported for exit_mode='scaled'")
+        ek_at_h    = int(early_kill["at_h"])
+        ek_mfe_thr = float(early_kill["mfe_thr"])
 
     has_atr            = "atr_pct"          in signals_df.columns
     has_entry_override = "entry_price_15m" in signals_df.columns
@@ -98,6 +119,13 @@ def run_backtest(signals_df: pd.DataFrame, exit_mode: str | None = None):
     tp1_price = 0.0
     tp2_price = 0.0
     tp1_hit   = False
+
+    # Early-kill tracker — only used when `early_kill` is set.  `max_fav_price`
+    # is running max of favourable excursion (in price units) since entry;
+    # `entry_bar_idx` is the bar index where the trade opened so we can detect
+    # the `at_h`-th post-entry bar.  Reset at every entry.
+    max_fav_price = 0.0
+    entry_bar_idx = 0
     tp2_hit   = False
     tp3_hit   = False
     be_moved  = False
@@ -219,6 +247,16 @@ def run_backtest(signals_df: pd.DataFrame, exit_mode: str | None = None):
                     in_trade = False
 
             else:  # scaled
+                # Track running max-favourable-excursion in price units
+                # (used by the optional early-kill rule below)
+                if ek_at_h is not None:
+                    if direction == 1:
+                        fav = high - entry_price
+                    else:
+                        fav = entry_price - low
+                    if fav > max_fav_price:
+                        max_fav_price = fav
+
                 # Snapshot whether TP1 was hit BEFORE this bar
                 tp1_was_hit = tp1_hit
 
@@ -313,7 +351,28 @@ def run_backtest(signals_df: pd.DataFrame, exit_mode: str | None = None):
                         equity_curve[date] = equity
                         continue
 
-                # 6. Time exit on remaining fraction
+                # 6a. Early-kill (experimental) — fires once on the at_h-th
+                #     post-entry bar IF TP1 has not yet hit AND running MFE in
+                #     R-units is below the threshold.  Force-closes the
+                #     remaining fraction at bar close (taker fill, like time).
+                if ek_at_h is not None and not tp1_hit:
+                    elapsed_bars = i - entry_bar_idx
+                    if elapsed_bars == ek_at_h:
+                        sl_dist = abs(entry_price - stop_price)
+                        mfe_r = max_fav_price / sl_dist if sl_dist > 0 else 0.0
+                        if mfe_r < ek_mfe_thr:
+                            fill = close * (1.0 - slip if direction == 1 else 1.0 + slip)
+                            pnl, r = _close_partial(fill, remaining_frac, is_limit=False)
+                            realized_pnl += pnl
+                            realized_r   += r
+                            rec = _finalize_scaled(fill, "early_kill", date)
+                            equity += realized_pnl
+                            trades.append(rec)
+                            in_trade = False
+                            equity_curve[date] = equity
+                            continue
+
+                # 6b. Time exit on remaining fraction
                 if i >= max_bar_idx and remaining_frac > 0:
                     fill = close * (1.0 - slip if direction == 1 else 1.0 + slip)
                     pnl, r = _close_partial(fill, remaining_frac, is_limit=False)
@@ -376,6 +435,10 @@ def run_backtest(signals_df: pd.DataFrame, exit_mode: str | None = None):
             realized_r   = 0.0
             remaining_frac = 1.0
             tp1_date = tp2_date = tp3_date = be_date = None
+
+            # Reset early-kill tracker
+            entry_bar_idx = i
+            max_fav_price = 0.0
 
             in_trade = True
 
