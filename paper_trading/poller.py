@@ -246,11 +246,25 @@ def _tick(
                 # (push_bar dedup-skipped because the bar was already in seed).
                 atr_dollars = result["atr_pct"] * result["close"]
                 monitor = MonitorState(
-                    asset        = asset,
-                    signal       = result["signal"],
-                    signal_ts    = ts.isoformat(),
-                    signal_close = result["close"],
-                    atr_1h       = atr_dollars,
+                    asset               = asset,
+                    signal              = result["signal"],
+                    signal_ts           = ts.isoformat(),
+                    signal_close        = result["close"],
+                    atr_1h              = atr_dollars,
+                    # Entry-state snapshot at SIGNAL time — for lifetime research.
+                    signal_buy_prob     = result["buy_prob"],
+                    signal_sell_prob    = result["sell_prob"],
+                    entry_atr_pct       = result["atr_pct"],
+                    entry_vol_ratio     = result.get("entry_vol_ratio"),
+                    entry_rsi           = result.get("entry_rsi"),
+                    entry_bb_pos        = result.get("entry_bb_pos"),
+                    entry_macd_hist     = result.get("entry_macd_hist"),
+                    entry_sma_50_ratio  = result.get("entry_sma_50_ratio"),
+                    entry_vol_expansion = result.get("entry_vol_expansion"),
+                    entry_volume        = result.get("entry_volume"),
+                    entry_trend         = result.get("entry_trend"),
+                    entry_vol_regime    = result.get("entry_vol_regime"),
+                    entry_session       = result.get("entry_session"),
                 )
                 monitors[asset] = monitor
                 log.info(

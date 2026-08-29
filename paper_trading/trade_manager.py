@@ -85,17 +85,63 @@ class TradeState:
     _mfe_price: float = 0.0
     _mae_price: float = 0.0
 
-    # MFE / MAE snapshots at fixed checkpoints after entry, recorded once each
-    # at the first 15m bar where elapsed >= 6 / 12 / 18 hours.  Used by the
-    # early-kill BT sweep (experiments/) to bracket when an under-performing
-    # setup could be cut.  None until the checkpoint is crossed; some may
-    # stay None if the trade closed earlier.
+    # MFE / MAE snapshots at fixed post-entry hour checkpoints.  Recorded once
+    # each on the first 15m bar where elapsed >= h.  Used by lifetime research
+    # (time-to-MFE distributions, early-kill sweeps, adaptive TP tuning).
+    # None until the checkpoint is crossed; some remain None if the trade
+    # closed earlier.  Extended to h1/h2/h4/h8/h24 on 2026-07-XX for
+    # Adaptive Time-Horizon Profit Capture research.
+    mfe_r_h1:  Optional[float] = None
+    mae_r_h1:  Optional[float] = None
+    mfe_r_h2:  Optional[float] = None
+    mae_r_h2:  Optional[float] = None
+    mfe_r_h4:  Optional[float] = None
+    mae_r_h4:  Optional[float] = None
     mfe_r_h6:  Optional[float] = None
     mae_r_h6:  Optional[float] = None
+    mfe_r_h8:  Optional[float] = None
+    mae_r_h8:  Optional[float] = None
     mfe_r_h12: Optional[float] = None
     mae_r_h12: Optional[float] = None
     mfe_r_h18: Optional[float] = None
     mae_r_h18: Optional[float] = None
+    mfe_r_h24: Optional[float] = None
+    mae_r_h24: Optional[float] = None
+
+    # Time-to-R-level (minutes from entry to FIRST crossing of each R-level).
+    # Only first crossing is recorded — a trade that touched 1R at t=90min,
+    # retraced to 0.5R, then broke out to 1.67R has t_to_1R=90 (not the later
+    # re-crossing).  This avoids post-hoc bias: the tracker only ever "knows"
+    # what the price did up to `now`.
+    t_to_0_3R:  Optional[float] = None
+    t_to_0_5R:  Optional[float] = None
+    t_to_0_65R: Optional[float] = None
+    t_to_1R:    Optional[float] = None
+    t_to_1_67R: Optional[float] = None
+
+    # MFE peak tracking — when did the running MFE reach its all-time high
+    # WITHIN THIS TRADE, and what was the running MAE just before that peak?
+    # Also: how many minutes elapsed from the peak to trade close (decay).
+    t_to_mfe_peak:        Optional[float] = None   # minutes from entry to peak
+    mae_r_before_mfe_peak: Optional[float] = None   # worst MAE_R before the peak
+    t_from_peak_to_exit:  Optional[float] = None   # minutes from peak to close
+
+    # Entry-state snapshot — copied from MonitorState at open_trade time.
+    # Observational; correlated post-hoc with time-to-MFE and outcomes to
+    # inform adaptive TP / setup classification research.
+    signal_buy_prob:      Optional[float] = None
+    signal_sell_prob:     Optional[float] = None
+    entry_atr_pct:        Optional[float] = None
+    entry_vol_ratio:      Optional[float] = None
+    entry_rsi:            Optional[float] = None
+    entry_bb_pos:         Optional[float] = None
+    entry_macd_hist:      Optional[float] = None
+    entry_sma_50_ratio:   Optional[float] = None
+    entry_vol_expansion:  Optional[float] = None
+    entry_volume:         Optional[float] = None
+    entry_trend:          Optional[str]   = None
+    entry_vol_regime:     Optional[str]   = None
+    entry_session:        Optional[str]   = None
 
     # Status
     status: str = "OPEN"    # "OPEN" | "CLOSED"
@@ -216,6 +262,22 @@ class TradeManager:
             exit_mode        = config_live.EXIT_MODE,
             tp1_price        = tp1_price,
             tp2_price        = tp2_price,
+            # Entry-state snapshot copied from MonitorState (populated by
+            # poller from signal_engine.score_bar).  Fields default to None
+            # so a monitor that predates this schema still opens cleanly.
+            signal_buy_prob      = getattr(monitor, "signal_buy_prob",      None),
+            signal_sell_prob     = getattr(monitor, "signal_sell_prob",     None),
+            entry_atr_pct        = getattr(monitor, "entry_atr_pct",        None),
+            entry_vol_ratio      = getattr(monitor, "entry_vol_ratio",      None),
+            entry_rsi            = getattr(monitor, "entry_rsi",            None),
+            entry_bb_pos         = getattr(monitor, "entry_bb_pos",         None),
+            entry_macd_hist      = getattr(monitor, "entry_macd_hist",      None),
+            entry_sma_50_ratio   = getattr(monitor, "entry_sma_50_ratio",   None),
+            entry_vol_expansion  = getattr(monitor, "entry_vol_expansion",  None),
+            entry_volume         = getattr(monitor, "entry_volume",         None),
+            entry_trend          = getattr(monitor, "entry_trend",          None),
+            entry_vol_regime     = getattr(monitor, "entry_vol_regime",     None),
+            entry_session        = getattr(monitor, "entry_session",        None),
         )
 
         self._trades[asset] = trade
@@ -236,11 +298,13 @@ class TradeManager:
         bar_ts: pd.Timestamp,
     ) -> None:
         """
-        If a 6h / 12h / 18h post-entry boundary has been crossed for the first
-        time, snapshot the current MFE / MAE into the trade record (in R-units).
+        Snapshot MFE / MAE (in R-units) at post-entry hour checkpoints —
+        h1 / h2 / h4 / h6 / h8 / h12 / h18 / h24 — each on the FIRST 15m bar
+        where the boundary is crossed.
 
         Must be called AFTER trade._mfe_price / _mae_price have been updated
-        for the current bar but BEFORE any exit fires.
+        for the current bar but BEFORE any exit fires, so the snapshot
+        reflects the bar that actually crossed the boundary.
         """
         r_unit = trade.atr_1h * config_live.STOP_LOSS_ATR_MULT
         if r_unit <= 0:
@@ -249,15 +313,87 @@ class TradeManager:
         entry_dt  = datetime.fromisoformat(trade.entry_ts)
         elapsed_h = (bar_ts.to_pydatetime() - entry_dt).total_seconds() / 3600
 
-        if elapsed_h >= 6 and trade.mfe_r_h6 is None:
-            trade.mfe_r_h6 = trade._mfe_price / r_unit
-            trade.mae_r_h6 = trade._mae_price / r_unit
+        mfe_r = trade._mfe_price / r_unit
+        mae_r = trade._mae_price / r_unit
+
+        # Same guard on each: first-crossing only, no retroactive rewrites.
+        if elapsed_h >= 1  and trade.mfe_r_h1  is None:
+            trade.mfe_r_h1,  trade.mae_r_h1  = mfe_r, mae_r
+        if elapsed_h >= 2  and trade.mfe_r_h2  is None:
+            trade.mfe_r_h2,  trade.mae_r_h2  = mfe_r, mae_r
+        if elapsed_h >= 4  and trade.mfe_r_h4  is None:
+            trade.mfe_r_h4,  trade.mae_r_h4  = mfe_r, mae_r
+        if elapsed_h >= 6  and trade.mfe_r_h6  is None:
+            trade.mfe_r_h6,  trade.mae_r_h6  = mfe_r, mae_r
+        if elapsed_h >= 8  and trade.mfe_r_h8  is None:
+            trade.mfe_r_h8,  trade.mae_r_h8  = mfe_r, mae_r
         if elapsed_h >= 12 and trade.mfe_r_h12 is None:
-            trade.mfe_r_h12 = trade._mfe_price / r_unit
-            trade.mae_r_h12 = trade._mae_price / r_unit
+            trade.mfe_r_h12, trade.mae_r_h12 = mfe_r, mae_r
         if elapsed_h >= 18 and trade.mfe_r_h18 is None:
-            trade.mfe_r_h18 = trade._mfe_price / r_unit
-            trade.mae_r_h18 = trade._mae_price / r_unit
+            trade.mfe_r_h18, trade.mae_r_h18 = mfe_r, mae_r
+        if elapsed_h >= 24 and trade.mfe_r_h24 is None:
+            trade.mfe_r_h24, trade.mae_r_h24 = mfe_r, mae_r
+
+    def _track_time_to_R_and_peak(
+        self,
+        trade: TradeState,
+        bar_ts: pd.Timestamp,
+    ) -> None:
+        """
+        Track TWO things per bar (called after MFE/MAE update, before exits):
+
+        1. Time-to-R crossings: minutes from entry when the current MFE
+           FIRST reaches each of 0.3 / 0.5 / 0.65 / 1.0 / 1.67 R.  Once set,
+           the field is never overwritten (matches live-observation semantics).
+
+        2. MFE peak: the running MFE's all-time high FOR THIS TRADE, when it
+           was reached, and the running MAE at the moment the peak was set.
+           Because MAX-MFE only increases, "MAE before peak" here means:
+           what MAE was recorded up to the bar where the peak was refreshed.
+        """
+        r_unit = trade.atr_1h * config_live.STOP_LOSS_ATR_MULT
+        if r_unit <= 0:
+            return
+
+        entry_dt   = datetime.fromisoformat(trade.entry_ts)
+        elapsed_m  = (bar_ts.to_pydatetime() - entry_dt).total_seconds() / 60.0
+        cur_mfe_r  = trade._mfe_price / r_unit
+        cur_mae_r  = trade._mae_price / r_unit
+
+        # (1) Time-to-R (first crossing only)
+        for level_r, attr in (
+            (0.30, "t_to_0_3R"),
+            (0.50, "t_to_0_5R"),
+            (0.65, "t_to_0_65R"),
+            (1.00, "t_to_1R"),
+            (1.67, "t_to_1_67R"),
+        ):
+            if cur_mfe_r >= level_r and getattr(trade, attr) is None:
+                setattr(trade, attr, elapsed_m)
+
+        # (2) MFE peak refresh
+        prev_peak = trade.__dict__.get("_prev_peak_mfe_r", 0.0)
+        if cur_mfe_r > prev_peak:
+            trade.__dict__["_prev_peak_mfe_r"] = cur_mfe_r
+            trade.t_to_mfe_peak         = elapsed_m
+            trade.mae_r_before_mfe_peak = cur_mae_r
+
+    def _finalize_peak_decay(
+        self,
+        trade: TradeState,
+        exit_ts: pd.Timestamp,
+    ) -> None:
+        """
+        Compute time-from-peak-to-exit at trade close.  Called by both the
+        original and scaled finalisers so the record is complete regardless
+        of exit mode.
+        """
+        if trade.t_to_mfe_peak is None or trade.entry_ts is None:
+            return
+        entry_dt = datetime.fromisoformat(trade.entry_ts)
+        exit_dt  = exit_ts.to_pydatetime() if hasattr(exit_ts, "to_pydatetime") else exit_ts
+        total_minutes = (exit_dt - entry_dt).total_seconds() / 60.0
+        trade.t_from_peak_to_exit = max(0.0, total_minutes - trade.t_to_mfe_peak)
 
     # ── Update ────────────────────────────────────────────────────────────────
 
@@ -318,10 +454,11 @@ class TradeManager:
         trade._mfe_price = max(trade._mfe_price, favourable)
         trade._mae_price = max(trade._mae_price, adverse)
 
-        # Snapshot 6h / 12h / 18h MFE/MAE if a checkpoint was just crossed.
-        # Must happen before any exit so the snapshot reflects the bar that
-        # ACTUALLY triggered the checkpoint, not the next bar.
+        # Hourly checkpoint snapshots + R-level time trackers + MFE peak.
+        # All three must run BEFORE any exit branch so the recorded values
+        # reflect the bar that actually crossed the threshold.
         self._maybe_snapshot_checkpoint(trade, bar_ts)
+        self._track_time_to_R_and_peak(trade, bar_ts)
 
         slip = config_live.SLIPPAGE_PCT
         exit_price  = None
@@ -386,6 +523,7 @@ class TradeManager:
         trade.mfe_r       = mfe_r
         trade.mae_r       = mae_r
         trade.status      = "CLOSED"
+        self._finalize_peak_decay(trade, exit_ts)
 
         del self._trades[asset]
 
@@ -435,9 +573,10 @@ class TradeManager:
         trade._mfe_price = max(trade._mfe_price, favourable)
         trade._mae_price = max(trade._mae_price, adverse)
 
-        # Snapshot 6h / 12h / 18h MFE/MAE if a checkpoint was just crossed.
-        # Same as in original mode — runs before any exit branch fires.
+        # Hourly checkpoints + R-level time trackers + MFE peak (same as
+        # original mode — always runs before any exit branch fires).
         self._maybe_snapshot_checkpoint(trade, bar_ts)
+        self._track_time_to_R_and_peak(trade, bar_ts)
 
         # ── Remember which TPs were already hit BEFORE this bar ───────────────
         tp1_was_hit = trade.tp1_hit   # prevents same-bar BE check after TP1 fires
@@ -628,6 +767,7 @@ class TradeManager:
         trade.mfe_r       = trade._mfe_price / r_unit if r_unit > 0 else 0.0
         trade.mae_r       = trade._mae_price / r_unit if r_unit > 0 else 0.0
         trade.status      = "CLOSED"
+        self._finalize_peak_decay(trade, exit_ts)
 
         del self._trades[asset]
 

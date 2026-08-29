@@ -83,6 +83,24 @@ class MonitorState:
     entry_price: Optional[float] = None
     entry_ts:    Optional[str]   = None   # ISO timestamp
 
+    # Model + market state snapshot at SIGNAL time (populated by poller).
+    # Observational only — used by lifetime research to correlate setup
+    # characteristics with trade outcomes.  All optional / default so a
+    # restart from an older state.json still deserialises cleanly.
+    signal_buy_prob:      Optional[float] = None
+    signal_sell_prob:     Optional[float] = None
+    entry_atr_pct:        Optional[float] = None
+    entry_vol_ratio:      Optional[float] = None
+    entry_rsi:            Optional[float] = None
+    entry_bb_pos:         Optional[float] = None
+    entry_macd_hist:      Optional[float] = None
+    entry_sma_50_ratio:   Optional[float] = None
+    entry_vol_expansion:  Optional[float] = None
+    entry_volume:         Optional[float] = None
+    entry_trend:          Optional[str]   = None
+    entry_vol_regime:     Optional[str]   = None
+    entry_session:        Optional[str]   = None
+
     # ── Serialisation ─────────────────────────────────────────────────────────
 
     def to_dict(self) -> dict:

@@ -170,6 +170,24 @@ class SignalEngine:
             close    = float(last["close"])
             bar_ts   = filtered.index[-1]
 
+            # Entry-state snapshot (added 2026-07-XX for lifetime research).
+            # These are observational — logged into TradeState at open time
+            # and used post-hoc by lifetime_analysis / adaptive TP research.
+            # Fetched via .get() with sensible defaults so an old model
+            # without a column doesn't break scoring.
+            entry_state = {
+                "entry_vol_ratio":     float(last.get("vol_ratio",     0.0)),
+                "entry_rsi":           float(last.get("rsi",           50.0)),
+                "entry_bb_pos":        float(last.get("bb_pos",        0.5)),
+                "entry_macd_hist":     float(last.get("macd_hist",     0.0)),
+                "entry_sma_50_ratio":  float(last.get("sma_50_ratio",  1.0)),
+                "entry_vol_expansion": float(last.get("vol_expansion", 0.0)),
+                "entry_volume":        float(last.get("volume",        0.0)),
+                "entry_trend":         str(last.get("trend",           "")),
+                "entry_vol_regime":    str(last.get("vol_regime",      "")),
+                "entry_session":       str(last.get("session",         "")),
+            }
+
             return {
                 "signal":    signal,
                 "buy_prob":  buy_prob,
@@ -177,6 +195,7 @@ class SignalEngine:
                 "atr_pct":   atr_pct,
                 "close":     close,
                 "bar_ts":    bar_ts,
+                **entry_state,
             }
 
         except Exception as exc:
