@@ -91,6 +91,15 @@ _COLUMNS = [
     "entry_trend",
     "entry_vol_regime",
     "entry_session",
+    # ── Shadow multi-horizon forecasts at signal time (log-only) ──────────────
+    "signal_buy_prob_h2",
+    "signal_sell_prob_h2",
+    "signal_buy_prob_h4",
+    "signal_sell_prob_h4",
+    "signal_buy_prob_h8",
+    "signal_sell_prob_h8",
+    "signal_buy_prob_h12",
+    "signal_sell_prob_h12",
     "notes",
     # ── Scaled exit columns ───────────────────────────────────────────────────
     "exit_mode",
@@ -181,6 +190,15 @@ class CsvWriter:
             "entry_trend":          getattr(trade, "entry_trend",       "") or "",
             "entry_vol_regime":     getattr(trade, "entry_vol_regime",  "") or "",
             "entry_session":        getattr(trade, "entry_session",     "") or "",
+            # Shadow multi-horizon forecasts (observational only)
+            "signal_buy_prob_h2":   _fmt(getattr(trade, "signal_buy_prob_h2",   None)),
+            "signal_sell_prob_h2":  _fmt(getattr(trade, "signal_sell_prob_h2",  None)),
+            "signal_buy_prob_h4":   _fmt(getattr(trade, "signal_buy_prob_h4",   None)),
+            "signal_sell_prob_h4":  _fmt(getattr(trade, "signal_sell_prob_h4",  None)),
+            "signal_buy_prob_h8":   _fmt(getattr(trade, "signal_buy_prob_h8",   None)),
+            "signal_sell_prob_h8":  _fmt(getattr(trade, "signal_sell_prob_h8",  None)),
+            "signal_buy_prob_h12":  _fmt(getattr(trade, "signal_buy_prob_h12",  None)),
+            "signal_sell_prob_h12": _fmt(getattr(trade, "signal_sell_prob_h12", None)),
             "notes":            trade.notes,
             # Scaled exit columns
             "exit_mode":           trade.exit_mode if is_scaled else "original",

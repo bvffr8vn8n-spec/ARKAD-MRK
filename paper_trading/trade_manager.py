@@ -143,6 +143,16 @@ class TradeState:
     entry_vol_regime:     Optional[str]   = None
     entry_session:        Optional[str]   = None
 
+    # Multi-horizon shadow forecasts at SIGNAL time (observational only).
+    signal_buy_prob_h2:   Optional[float] = None
+    signal_sell_prob_h2:  Optional[float] = None
+    signal_buy_prob_h4:   Optional[float] = None
+    signal_sell_prob_h4:  Optional[float] = None
+    signal_buy_prob_h8:   Optional[float] = None
+    signal_sell_prob_h8:  Optional[float] = None
+    signal_buy_prob_h12:  Optional[float] = None
+    signal_sell_prob_h12: Optional[float] = None
+
     # Status
     status: str = "OPEN"    # "OPEN" | "CLOSED"
     notes:  str = ""
@@ -278,6 +288,15 @@ class TradeManager:
             entry_trend          = getattr(monitor, "entry_trend",          None),
             entry_vol_regime     = getattr(monitor, "entry_vol_regime",     None),
             entry_session        = getattr(monitor, "entry_session",        None),
+            # Shadow multi-horizon forecasts (observational only)
+            signal_buy_prob_h2   = getattr(monitor, "signal_buy_prob_h2",   None),
+            signal_sell_prob_h2  = getattr(monitor, "signal_sell_prob_h2",  None),
+            signal_buy_prob_h4   = getattr(monitor, "signal_buy_prob_h4",   None),
+            signal_sell_prob_h4  = getattr(monitor, "signal_sell_prob_h4",  None),
+            signal_buy_prob_h8   = getattr(monitor, "signal_buy_prob_h8",   None),
+            signal_sell_prob_h8  = getattr(monitor, "signal_sell_prob_h8",  None),
+            signal_buy_prob_h12  = getattr(monitor, "signal_buy_prob_h12",  None),
+            signal_sell_prob_h12 = getattr(monitor, "signal_sell_prob_h12", None),
         )
 
         self._trades[asset] = trade

@@ -59,11 +59,22 @@ class SignalEngine:
     """
 
     def __init__(self) -> None:
-        self._models: dict[str, object]            = {}   # asset → fitted model
+        self._models: dict[str, object]            = {}   # asset → fitted model (24H primary)
         self._feature_cols: dict[str, list[str]]   = {}   # asset → feature col list
         self._buffers: dict[str, pd.DataFrame]     = {}   # asset → rolling OHLCV buffer
         self._bars_since_retrain: dict[str, int]   = {}   # asset → counter
         self._atr_at_signal: dict[str, float]      = {}   # asset → atr_pct of last signal bar
+
+        # ── Multi-horizon shadow models ──────────────────────────────────────
+        # Shadow-mode ONLY: their probabilities are logged into TradeState for
+        # post-hoc research but never used for any trading decision.  Keyed
+        # by (asset, horizon_bars).  Populated by _train_from_df when
+        # SHADOW_HORIZONS is non-empty; skipped otherwise.
+        self._shadow_models:       dict[tuple[str, int], object] = {}
+        self._shadow_feature_cols: dict[tuple[str, int], list[str]] = {}
+
+    # ── Config ────────────────────────────────────────────────────────────────
+    SHADOW_HORIZONS: tuple[int, ...] = (2, 4, 8, 12)
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -188,6 +199,28 @@ class SignalEngine:
                 "entry_session":       str(last.get("session",         "")),
             }
 
+            # ── Shadow multi-horizon forecasts (observational only) ──────────
+            # Runs each shadow model on the same feature vector and returns
+            # per-horizon buy_prob / sell_prob.  Never influences any trade
+            # decision — used only for post-hoc lifetime research.
+            shadow_forecasts: dict[str, float] = {}
+            last_features = df.iloc[[-1]]
+            for h in self.SHADOW_HORIZONS:
+                key = (asset, h)
+                shadow_model = self._shadow_models.get(key)
+                if shadow_model is None:
+                    continue
+                try:
+                    proba = shadow_model.predict_proba(last_features[feature_cols])[-1]
+                    classes = list(shadow_model.classes_)
+                    b = float(proba[classes.index(1)])  if 1  in classes else 0.0
+                    s = float(proba[classes.index(-1)]) if -1 in classes else 0.0
+                    shadow_forecasts[f"buy_prob_h{h}"]  = b
+                    shadow_forecasts[f"sell_prob_h{h}"] = s
+                except Exception as exc:
+                    log.warning("Shadow score failed for %s h=%dh: %s",
+                                asset, h, exc)
+
             return {
                 "signal":    signal,
                 "buy_prob":  buy_prob,
@@ -196,6 +229,7 @@ class SignalEngine:
                 "close":     close,
                 "bar_ts":    bar_ts,
                 **entry_state,
+                **shadow_forecasts,
             }
 
         except Exception as exc:
@@ -305,11 +339,21 @@ class SignalEngine:
 
         Trains on ALL rows (no train/test split) so every available bar informs
         the live model.
+
+        Also trains shadow multi-horizon models (2H/4H/8H/12H) if SHADOW_HORIZONS
+        is non-empty.  These models predict per-horizon direction using scaled
+        ATR labels (variant B: mult(h) = LABEL_ATR_MULT × sqrt(h / 24)) and are
+        logged into TradeState per trade — NEVER used for any decision.
         """
+        from features.generator import add_multi_horizon_labels
+
         df = generate_features(df_raw.copy())
         df = add_regime_columns(df)
         df = add_session_column(df)
         df = add_labels(df)
+        # Multi-horizon labels first, then dropna covers all in one pass
+        if self.SHADOW_HORIZONS:
+            df = add_multi_horizon_labels(df, horizons=self.SHADOW_HORIZONS)
         df.dropna(inplace=True)
 
         if len(df) < 200:
@@ -317,8 +361,51 @@ class SignalEngine:
                 f"Only {len(df)} labeled rows — not enough to train {asset}"
             )
 
-        feature_cols = get_feature_columns(df)
+        feature_cols = [
+            c for c in get_feature_columns(df)
+            if not (c.startswith("label_h") or c.startswith("fwd_return_h"))
+        ]
         model = fit_model(df, feature_cols)
 
         self._models[asset]       = model
         self._feature_cols[asset] = feature_cols
+
+        # Report primary 24H class distribution (baseline reference)
+        self._log_class_distribution(asset, df, "label", 24)
+
+        # Train shadow multi-horizon models — one per horizon, same feature set
+        for h in self.SHADOW_HORIZONS:
+            label_col = f"label_h{h}"
+            if label_col not in df.columns:
+                continue
+            # Build training df that uses label_h{h} as the "label" for fit_model
+            df_h = df.copy()
+            df_h["label"] = df_h[label_col]
+            n_dir = int((df_h["label"] != 0).sum())
+            if n_dir < 100:
+                log.warning(
+                    "  %s h=%dh: only %d directional bars — skipping shadow model",
+                    asset, h, n_dir,
+                )
+                continue
+            shadow_model = fit_model(df_h, feature_cols)
+            self._shadow_models[(asset, h)]       = shadow_model
+            self._shadow_feature_cols[(asset, h)] = feature_cols
+            self._log_class_distribution(asset, df, label_col, h)
+
+    def _log_class_distribution(
+        self, asset: str, df: pd.DataFrame, label_col: str, horizon_h: int
+    ) -> None:
+        """Print BUY / HOLD / SELL counts + percentages for one horizon."""
+        n = len(df)
+        if n == 0:
+            return
+        buy   = int((df[label_col] ==  1).sum())
+        sell  = int((df[label_col] == -1).sum())
+        hold  = n - buy - sell
+        log.info(
+            "  %s h=%2dh  labels: BUY=%5d (%4.1f%%)  HOLD=%5d (%4.1f%%)  "
+            "SELL=%5d (%4.1f%%)  total=%d",
+            asset, horizon_h,
+            buy, buy/n*100, hold, hold/n*100, sell, sell/n*100, n,
+        )

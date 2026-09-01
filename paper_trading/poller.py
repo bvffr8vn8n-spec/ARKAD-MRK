@@ -265,6 +265,15 @@ def _tick(
                     entry_trend         = result.get("entry_trend"),
                     entry_vol_regime    = result.get("entry_vol_regime"),
                     entry_session       = result.get("entry_session"),
+                    # Shadow multi-horizon forecasts (observational, log-only)
+                    signal_buy_prob_h2   = result.get("buy_prob_h2"),
+                    signal_sell_prob_h2  = result.get("sell_prob_h2"),
+                    signal_buy_prob_h4   = result.get("buy_prob_h4"),
+                    signal_sell_prob_h4  = result.get("sell_prob_h4"),
+                    signal_buy_prob_h8   = result.get("buy_prob_h8"),
+                    signal_sell_prob_h8  = result.get("sell_prob_h8"),
+                    signal_buy_prob_h12  = result.get("buy_prob_h12"),
+                    signal_sell_prob_h12 = result.get("sell_prob_h12"),
                 )
                 monitors[asset] = monitor
                 log.info(

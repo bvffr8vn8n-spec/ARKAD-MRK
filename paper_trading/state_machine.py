@@ -101,6 +101,18 @@ class MonitorState:
     entry_vol_regime:     Optional[str]   = None
     entry_session:        Optional[str]   = None
 
+    # Multi-horizon shadow forecasts at SIGNAL time — observational only.
+    # None if shadow models were not trained for that horizon (insufficient
+    # directional samples) or if the score failed.
+    signal_buy_prob_h2:   Optional[float] = None
+    signal_sell_prob_h2:  Optional[float] = None
+    signal_buy_prob_h4:   Optional[float] = None
+    signal_sell_prob_h4:  Optional[float] = None
+    signal_buy_prob_h8:   Optional[float] = None
+    signal_sell_prob_h8:  Optional[float] = None
+    signal_buy_prob_h12:  Optional[float] = None
+    signal_sell_prob_h12: Optional[float] = None
+
     # ── Serialisation ─────────────────────────────────────────────────────────
 
     def to_dict(self) -> dict:

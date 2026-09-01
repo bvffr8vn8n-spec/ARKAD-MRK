@@ -90,6 +90,56 @@ def add_labels(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_multi_horizon_labels(
+    df: pd.DataFrame,
+    horizons: tuple[int, ...] = (2, 4, 8, 12),
+    base_mult: float | None = None,
+    base_horizon: int | None = None,
+) -> pd.DataFrame:
+    """
+    Add per-horizon labels for multi-horizon shadow-mode research.
+
+    For each horizon h in `horizons`, adds columns:
+        label_h{h}       — {-1, 0, +1} using scaled ATR multiplier
+        fwd_return_h{h}  — raw forward return over h bars
+
+    Scaled multiplier (variant B, sqrt-of-time):
+        mult(h) = base_mult * sqrt(h / base_horizon)
+
+    Rationale: price movement ~ sqrt(t) under Brownian-motion assumptions,
+    so 0.85 ATR over 24 bars corresponds to ~0.24 ATR over 2 bars.  Keeps
+    label semantics comparable across horizons — "meaningful directional
+    move for THIS horizon" rather than "same absolute move regardless of h".
+
+    Same semantics as `add_labels`, applied per-horizon.  Called by
+    signal_engine._train_from_df only when multi-horizon shadow-mode is
+    enabled; primary 24H model still uses `label` from `add_labels`.
+    """
+    import math
+
+    if base_mult is None:
+        base_mult = config.LABEL_ATR_MULT
+    if base_horizon is None:
+        base_horizon = config.FORWARD_RETURN_WINDOW
+
+    if "atr_pct" not in df.columns:
+        raise ValueError(
+            "add_multi_horizon_labels() requires 'atr_pct' column. "
+            "Call generate_features() first."
+        )
+
+    df = df.copy()
+    for h in horizons:
+        mult = base_mult * math.sqrt(h / base_horizon)
+        fwd  = df["close"].shift(-h) / df["close"] - 1
+        fwd_atr = fwd / df["atr_pct"]
+        df[f"fwd_return_h{h}"] = fwd
+        df[f"label_h{h}"] = 0
+        df.loc[fwd_atr >=  mult, f"label_h{h}"] =  1
+        df.loc[fwd_atr <= -mult, f"label_h{h}"] = -1
+    return df
+
+
 # ── Private helpers ───────────────────────────────────────────────────────────
 
 def _add_return_features(df: pd.DataFrame) -> pd.DataFrame:
